@@ -38,6 +38,7 @@ import {
 import { sessionIndex } from "./session-index.js";
 import { readOmpMessages, scanOmpSessions, type OmpNativeSession } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
+import { isPresetName, permissionEventsFor, readWebuiPreset, statWebuiArtifact, type WebuiStat } from "./permission.js";
 /** The slice of `ctx.sessionProjectionCache` the list-title warm path reads. */
 interface ProjectionCacheSlice {
   coldSnapshot(id: SessionId, signal?: AbortSignal): Promise<unknown>;
@@ -48,8 +49,14 @@ interface ProjectionCacheSlice {
 /** How often the projection-cache warm pass rescans for changed transcripts. */
 const WARM_INTERVAL_MS = 60_000;
 
-/** Memoized replayed Dash logs, keyed by session file path + (size, mtime). */
-const logCache = new Map<string, { size: number; mtimeMs: number; events: SessionEvent[] }>();
+/** Memoized replayed Dash logs, keyed by session file path + (size, mtime) of the transcript and the webui.json artifact. */
+const logCache = new Map<string, { size: number; mtimeMs: number; webui: WebuiStat | undefined; events: SessionEvent[] }>();
+
+/** Structural compare of two optional stat tokens. */
+function sameStat(left: WebuiStat | undefined, right: WebuiStat | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.size === right.size && left.mtimeMs === right.mtimeMs;
+}
 
 export class OmpUnionSessionPersistence extends SessionPersistence {
   readonly supportsRawArtifacts = true;
@@ -130,7 +137,15 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
     });
   }
 
-  /** The full replayed Dash event log for one scanned-native session (memoized). */
+  /**
+   * The full replayed Dash event log for one scanned-native session
+   * (memoized on the transcript's (size, mtime) plus the webui.json
+   * artifact's). When the bridge persisted a permission preset for the
+   * session, the three Dash permission events are synthesized at the HEAD
+   * of the stream — OMP's transcript never records them, so without this a
+   * wrapper restart would leave the UI showing no (or the default)
+   * permission for the session. Seqs stay contiguous from 0.
+   */
   private eventsOf(entry: OmpNativeSession): SessionEvent[] {
     let size: number;
     let mtimeMs: number;
@@ -141,10 +156,26 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
     } catch {
       return [];
     }
+    const webui = statWebuiArtifact(entry.ompSessionFile);
     const cached = logCache.get(entry.ompSessionFile);
-    if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs) return cached.events;
-    const events = replayOmpTranscript(readOmpMessages(entry.ompSessionFile), entry.title, entry.createdAt);
-    logCache.set(entry.ompSessionFile, { size, mtimeMs, events });
+    if (
+      cached !== undefined &&
+      cached.size === size &&
+      cached.mtimeMs === mtimeMs &&
+      sameStat(cached.webui, webui)
+    ) {
+      return cached.events;
+    }
+    const replayed = replayOmpTranscript(readOmpMessages(entry.ompSessionFile), entry.title, entry.createdAt);
+    const preset = webui === undefined ? undefined : readWebuiPreset(entry.ompSessionFile);
+    const events =
+      preset !== undefined && isPresetName(preset)
+        ? [...permissionEventsFor(preset, entry.createdAt), ...replayed].map((event, index) => ({
+            ...event,
+            seq: index,
+          }))
+        : replayed;
+    logCache.set(entry.ompSessionFile, { size, mtimeMs, webui, events });
     return events;
   }
 

@@ -27,6 +27,12 @@
       "@deepseek-ai/dsh-session": [
         "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-session/lib/types/index.d.ts"
       ],
+      "@deepseek-ai/dsh-session/types": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-session/lib/types/types.d.ts"
+      ],
+      "@deepseek-ai/dsh-commands": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-commands/lib/types/index.d.ts"
+      ],
       "@deepseek-ai/dsh-user-approval": [
         "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-user-approval/lib/types/index.d.ts"
       ],

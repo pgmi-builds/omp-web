@@ -30,7 +30,7 @@ import type {
   ResumeAgentOptions,
 } from "@deepseek-ai/dsh-agent";
 import { emitAgentEvent } from "@deepseek-ai/dsh-agent";
-import { SessionPreparation, type SessionId } from "@deepseek-ai/dsh-session";
+import { SessionPreparation, type SessionEvent, type SessionId } from "@deepseek-ai/dsh-session";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
 import type { WorkspaceRegistry } from "@deepseek-ai/dsh-workspace";
 import { OmpRpcClient } from "./rpc.js";
@@ -41,27 +41,8 @@ import { OmpLlmAdapter } from "./adapter.js";
 import { OmpUnionSessionPersistence } from "./session-persistence-omp.js";
 import { SingleOmpPresetRoster } from "./agent-preset-omp.js";
 import { cwdFromSessionFile, OMP_SESSIONS_ROOT, scanOmpSessions } from "./omp-store.js";
+import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents, readWebuiPreset, writeWebuiPreset } from "./permission.js";
 import { ompProviderIds } from "./models.js";
-/**
- * OMP approval mode for the spawned session. Mirrors Dash's `workspace-write`
- * sandbox default (approval: ask): read + workspace-write tools auto-approve,
- * while exec tools (bash, eval, browser, task) prompt through the approval
- * surface bridged into Dash's Web UI. Override with OMP_APPROVAL_MODE for
- * unattended runs (e.g. `yolo`).
- *
- * Only the three modes OMP actually implements are accepted. Any missing or
- * invalid value (including a typo like `writ`) falls back to `write`, the
- * fail-safe default, because OMP silently degrades unknown modes to `yolo`
- * (auto-approving destructive tools).
- */
-const APPROVAL_MODES = ["write", "always-ask", "yolo"] as const;
-
-function resolveApprovalMode(raw: string | undefined): string {
-  if (raw !== undefined && (APPROVAL_MODES as readonly string[]).includes(raw)) return raw;
-  return "write";
-}
-
-const OMP_APPROVAL_MODE = resolveApprovalMode(process.env.OMP_APPROVAL_MODE);
 
 /** Realpath of a recorded cwd, accepted only when it names an existing directory. */
 function validatedCwd(cwd: string | undefined): string | undefined {
@@ -82,11 +63,12 @@ const trace = (...parts: unknown[]): void => {
 /**
  * The slice of `ctx.sessionPersistence` (dsh-session-persistence) resume
  * depends on. Typed locally so the plugin needs no dependency on the
- * persistence package; the runtime contract is stable (`prepare` restores
- * the durable log as an unpublished `SessionPreparation`).
+ * persistence package; the runtime contract is stable (`load` returns the
+ * durable log, `prepare` restores it as an unpublished `SessionPreparation`).
  */
 interface SessionPersistenceSlice {
   list(signal?: AbortSignal): Promise<{ id: string }[]>;
+  load(id: SessionId): Promise<{ events: SessionEvent[] }>;
   prepare(id: SessionId, signal?: AbortSignal): Promise<SessionPreparation>;
 }
 
@@ -191,16 +173,24 @@ export class OmpProvider extends Service implements AgentFactory {
     const meta = options.meta ?? {};
     const cwd = meta.cwd;
 
+    // Approval policy is pinned at OMP launch and the Dash session does not
+    // exist yet at this point (it is prepared + announced — which is what
+    // stamps `permission/preset` via pinInitialPermission — only inside
+    // setupAndPublish, AFTER this spawn), so the effective preset cannot
+    // come from session events: read the permission service's default and
+    // map it onto the launch flag. OMP_APPROVAL_MODE (headless runs) wins.
+    const envMode = envApprovalMode();
+    const preset = defaultPermissionPreset(loopCtx);
+    const approvalMode = envMode ?? ompApprovalMode(preset);
+    trace(`create id=${id} preset=${preset ?? "none"} approval-mode=${approvalMode}${envMode === undefined ? "" : " (env override)"}`);
+
     // Spawn OMP and wait for the `ready` handshake.
-    const rpc = await OmpRpcClient.spawn(["--approval-mode", OMP_APPROVAL_MODE], cwd);
+    const rpc = await OmpRpcClient.spawn(["--approval-mode", approvalMode], cwd);
 
     try {
       // Capture OMP's session identity so resume can recover it later.
       const state = await rpc.getState();
 
-      // Persist the Dash→OMP mapping BEFORE the session/agent publish, so a
-      // mapping-write failure (unwritable DASH_HOME, ENOSPC) rejects while
-      // nothing live has been entered/announced/emitted — no leaked agent.
       if (state.sessionId !== undefined && state.sessionFile !== undefined) {
         await sessionIndex.put(id, {
           ompSessionId: state.sessionId,
@@ -208,6 +198,11 @@ export class OmpProvider extends Service implements AgentFactory {
           ...(cwd === undefined ? {} : { cwd }),
           createdAt: Date.now(),
         });
+
+        // Persist the Dash-side preset next to OMP's transcript: cold reads
+        // synthesize the permission events from it after wrapper restarts,
+        // and resume re-derives the spawn flag. Best-effort by contract.
+        if (preset !== undefined) writeWebuiPreset(state.sessionFile, preset);
       }
 
       // Prepare the unpublished session (mirrors dsh-agent-loop's SessionPreparation).
@@ -257,10 +252,6 @@ export class OmpProvider extends Service implements AgentFactory {
     const persisted =
       persistence !== undefined && (await persistence.list()).some((header) => header.id === id);
     trace(`resume id=${id} persisted=${persisted}`);
-    if (!persisted) {
-      throw new Error(`cannot resume session "${id}": not owned by this profile's session persistence (cross-workspace resume blocked)`);
-    }
-
     // Spawn cwd is derived from the session's LOCATION in OMP's store (the
     // dashed parent directory), never the mapping's verbatim cwd field; the
     // header-record cwd (also OMP-authored, inside the file) is the fallback
@@ -272,9 +263,23 @@ export class OmpProvider extends Service implements AgentFactory {
     }
     trace(`resume id=${id} spawnCwd=${spawnCwd}`);
 
+    // Approval mode for the re-attached child: launch-only, so it is decided
+    // BEFORE the spawn from the bridge's persisted preset (webui.json),
+    // falling back to the replayed session log (which carries the
+    // synthesized permission events for wrapper-created sessions).
+    // OMP_APPROVAL_MODE (headless runs) overrides; no preset → native yolo.
+    const envMode = envApprovalMode();
+    const preset =
+      readWebuiPreset(sessionFile) ??
+      (persistence !== undefined
+        ? presetFromEvents((await persistence.load(id)).events)
+        : undefined);
+    const approvalMode = envMode ?? ompApprovalMode(preset);
+    trace(`resume id=${id} preset=${preset ?? "none"} approval-mode=${approvalMode}${envMode === undefined ? "" : " (env override)"}`);
+
     // Re-attach to the OMP session by its persisted file (OMP owns the live
     // agent transcript and keeps generating it from here on).
-    const rpc = await OmpRpcClient.spawn(["--approval-mode", OMP_APPROVAL_MODE, "--resume", sessionFile], spawnCwd);
+    const rpc = await OmpRpcClient.spawn(["--approval-mode", approvalMode, "--resume", sessionFile], spawnCwd);
 
     try {
       // Seed the Dash session log by replaying the OMP transcript through the

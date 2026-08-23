@@ -40,6 +40,9 @@ import { CallId, createAssistantMessage, createToolResultMessage, createUserMess
 import { createScope, type Scope } from "@deepseek-ai/dsh-scope";
 import type { ApprovalOutcome, ApprovalService } from "@deepseek-ai/dsh-user-approval";
 import type { OmpAssistantMessageEvent, OmpContentBlock, OmpMessage, OmpRpcClient, RpcEvent } from "./rpc.js";
+// Type-only: pulls dsh-commands' `Context.commands` augmentation into this
+// compilation (the runtime service is mounted by the base bundle).
+import type {} from "@deepseek-ai/dsh-commands";
 
 /** Diagnostic trace (set OMP_TRACE=1 on the dsh process to enable). */
 const TRACE = process.env.OMP_TRACE === "1";
@@ -94,6 +97,19 @@ function userMessageText(message: UserMessage): string {
     if (block.type === "text") parts.push(block.text);
   }
   return parts.join("\n");
+}
+
+/**
+ * Dash-host plugin narration from the approval service: the policy-change
+ * notice `agent.inject` carries when `/permission` switches a live session's
+ * approval policy. OMP has no runtime approval control (its `--approval-mode`
+ * is pinned at launch, with no RPC to change it mid-session), so forwarding
+ * the text would steer it into an in-flight turn (interrupting tool work) and
+ * echo it into history as a fake user prompt. Detect and drop it.
+ */
+function isApprovalNarration(message: UserMessage): boolean {
+  const source = message.source;
+  return source.kind === "plugin" && source.plugin === "user-approval";
 }
 
 /**
@@ -262,6 +278,23 @@ export class OmpAgent implements Agent {
     if (!session.events.some((event) => event.type === "agent-preset/selected" && event.data?.agentPreset === "omp")) {
       session.append("agent-preset/selected", { agentPreset: "omp" });
     }
+    // `/permission` cannot work here: OMP pins `--approval-mode` at launch and
+    // no RPC changes it mid-session. Registering the SAME name on this agent's
+    // own scope (a command-injected child of `agent.ctx`) SHADOWS the global
+    // permission command for this agent only — the switch then fails cleanly
+    // instead of appending approval/policy events OMP cannot honor. (The
+    // `inject` narration drop below stays as the backstop.)
+    this.ctx.inject(["commands"], (cmdCtx) =>
+      cmdCtx.commands.register({
+        name: "permission",
+        description: "Unavailable for OMP sessions (approval policy is fixed at OMP launch)",
+        input: { hint: "<preset>" },
+        handler: () => ({
+          kind: "error" as const,
+          text: "Approval policy is fixed at OMP launch; runtime switching is not supported for OMP sessions.",
+        }),
+      }),
+    );
   }
 
   get status(): AgentStatus {
@@ -288,6 +321,16 @@ export class OmpAgent implements Agent {
   }
 
   inject(message: UserMessage): void {
+    // Dash-host approval-policy narrations have no OMP runtime equivalent
+    // (OMP pins `--approval-mode` at launch; no RPC changes it mid-session).
+    // Forwarding the text would steer it into an in-flight turn — interrupting
+    // tool work — and echo it into history as a fake user prompt. Drop it; the
+    // accompanying `approval/policy` session event stays recorded so the UI's
+    // permission state remains truthful.
+    if (isApprovalNarration(message)) {
+      trace("inject: dropped approval-policy narration (OMP lacks runtime approval control)");
+      return;
+    }
     // Mirrors dsh-agent-loop's `inject = send(input, "next-step", false)`:
     // queued without waking; idle drivers leave it pending until a later
     // follow-up/steer wakes them (flushed at the next agent_start).

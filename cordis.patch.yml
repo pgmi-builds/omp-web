@@ -1,0 +1,7 @@
+# dsh-omp-provider bundle patch. This file must remain a top-level YAML array
+# to satisfy the bundle loader, but it intentionally mounts NOTHING on the
+# profile plane: the `omp-provider` row is inserted by the omp profile's own
+# cordis.patch.yml (the profile owns the composition decision). This bundle's
+# package.json still declares `dsh.bundle.patch` so `dsh plugin` reconciles it
+# as a profile layer and the Loader resolves `dsh-omp-provider` by name.
+[]

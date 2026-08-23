@@ -1,0 +1,35 @@
+# --- dependencies ---
+node_modules/
+
+# --- python venv ---
+.venv/
+
+# --- upstream sources (tracked in their own git repos) ---
+upstream/
+
+# --- graphify knowledge-graph output ---
+graphify-out/
+.graphifyignore
+
+# --- scratch notes / disposable artifacts ---
+.scratch/
+
+# --- internal dev artifacts ---
+dev/
+
+# "./docs/" is assets, references, any others sit along with the repo
+
+# --- build output ---
+dist/
+build/
+lib/
+*.tsbuildinfo
+*.tsbuildinfo.*
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+
+# --- local agent tooling (keep on disk, never commit) ---
+.agents/
+.pi/

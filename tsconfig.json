@@ -1,0 +1,54 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": [
+      "ES2023",
+      "esnext.disposable"
+    ],
+    "types": [
+      "node"
+    ],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "baseUrl": ".",
+    "paths": {
+      "@deepseek-ai/cordis": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/cordis/lib/types/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-agent": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-agent/lib/types/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-llm": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-llm/lib/types/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-scope": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-scope/lib/types/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-session": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-session/lib/types/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-user-approval": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-user-approval/lib/types/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-session-persistence": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-session-persistence/lib/types/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-session-persistence-jsonl": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/types/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-workspace": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-workspace/lib/types/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-agent-presets": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-agent-presets/lib/types/index.d.ts"
+      ]
+    },
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": [
+    "src"
+  ]
+}

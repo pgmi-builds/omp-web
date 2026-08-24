@@ -228,3 +228,28 @@ live-twin 去重补丁（该 hack 已被自然消解删除）。已实施：
   桥接层不补写
 - 派生公式 `session-<ompId>` 冻结为合同；上游若改 id 形态，桥接层零改动（§9 系列
   结论的延续）
+
+## 12. 同日收尾：测试会话物理清理 + OMP 存储面勘验
+
+### 12.1 旧 OMP 会话的 dash id——无需回填
+
+评审结论：不补。派生 id 本身就是 dash 形态（`session-<uuidv7>`，与 apiproxy 的
+`session-<uuid4>` 同为上游可接受的 opaque 字符串），且由 §11.1 的冻结公式**无状态、
+稳定**地生成——回填只会把同一个字符串写进 webui.json，平添桥接层对 TUI 会话（非桥接
+创建）的目录写入足迹，零收益。派生即补全。
+
+### 12.2 测试会话物理清除（43 条）
+
+无中央持久存储 ⇒ 物理删除即收敛。按 canary 标记（`Reply with exactly:`、`[*-probe]`、
+`[dsh003-*]`、`List the first 30 prime`、`(none)`、`probe-writ` 等）清除 43 条测试
+会话，保留 17 条真实开发/用户会话。全程：tar 备份至 /tmp → rm transcript + 孪生
+artifact 目录 → workspace.json 剪 14 条悬空绑定（`.post-clean` 备份）→ 重启核验
+（17 行、0 残留测试行、journal 无 error）。
+
+### 12.3 OMP 有无中央 session list？——有，但不是权威
+
+`~/.omp/agent/` 下有 `agent.db`（认证/用量/settings）与 `history.db`（`session_titles`
+表 + FTS `history`）。`session_titles` 是 **OMP TUI 的 title 缓存**（10 行、全为真实
+会话，测试会话根本不在内），不是 reconcile 权威；OMP 会话本体以 `sessions/` 目录扫描
+为准。物理删除后：桥接层只扫目录 → 自愈；OMP TUI 若搜到已删会话的 FTS 幽灵，只是
+resume 落空，不影响桥接。无报错路径。

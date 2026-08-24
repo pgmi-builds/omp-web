@@ -37,16 +37,12 @@ import {
 } from "@deepseek-ai/dsh-session";
 import { readOmpMessages, scanOmpSessions, type OmpNativeSession } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
-import { isPresetName, permissionEventsFor, readWebuiPreset, statWebuiArtifact, type WebuiStat } from "./permission.js";
-/** The slice of `ctx.sessionProjectionCache` the list-title warm path reads. */
-interface ProjectionCacheSlice {
-  coldSnapshot(id: SessionId, signal?: AbortSignal): Promise<unknown>;
+import { isPresetName, permissionEventsFor, readWebuiDashId, readWebuiPreset, statWebuiArtifact, type WebuiStat } from "./permission.js";
+
+/** The slice of `ctx.sessions` the list live-twin de-dup reads. */
+interface SessionsSlice {
+  get(id: SessionId): unknown;
 }
-
-
-
-/** How often the projection-cache warm pass rescans for changed transcripts. */
-const WARM_INTERVAL_MS = 60_000;
 
 /** Memoized replayed Dash logs, keyed by session file path + (size, mtime) of the transcript and the webui.json artifact. */
 const logCache = new Map<string, { size: number; mtimeMs: number; webui: WebuiStat | undefined; events: SessionEvent[] }>();
@@ -62,43 +58,6 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
 
   constructor(ctx: Context) {
     super(ctx);
-    this.warmProjectionCache();
-  }
-
-  /**
-   * Warm the host's persisted projection cache for scanned-native sessions so
-   * `session.list` rows carry their `title` (and stats) projections from the
-   * first listing, without each row having been opened once. `coldSnapshot`
-   * reads through THIS service (replay) and writes the durable row itself.
-   * The pass repeats on a timer but only re-reads sessions whose transcript
-   * changed since the last pass (the scan's size+mtime revision token), so
-   * TUI-created or TUI-extended sessions pick up list titles within a minute.
-   * Sequential and fail-soft per session.
-   */
-  private warmProjectionCache(): void {
-    this.ctx.inject(["sessionProjectionCache"], (warmCtx) => {
-      const cache = warmCtx.get("sessionProjectionCache") as ProjectionCacheSlice | undefined;
-      if (cache === undefined) return;
-      const warmed = new Map<string, string>();
-      const pass = async (): Promise<void> => {
-        for (const entry of scanOmpSessions().values()) {
-          if (warmed.get(entry.ompSessionFile) === entry.revision) continue;
-          try {
-            await cache.coldSnapshot(SessionId(entry.ompSessionId));
-            warmed.set(entry.ompSessionFile, entry.revision);
-          } catch {
-            // Fail-soft per session: an unreadable transcript degrades its
-            // list row's projections, never the boot.
-          }
-        }
-      };
-      void pass();
-      warmCtx.effect(() => {
-        const timer = setInterval(() => void pass(), WARM_INTERVAL_MS);
-        timer.unref?.();
-        return () => clearInterval(timer);
-      }, "ompProvider.projectionWarmTimer");
-    });
   }
 
   /** The scanned entry for an id, when OMP's store owns it. */
@@ -177,7 +136,18 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
 
   async list(signal?: AbortSignal): Promise<SessionHeader[]> {
     signal?.throwIfAborted();
-    return [...scanOmpSessions().values()].map((entry) => this.headerOf(entry));
+    // A bridge-created session is LIVE under its Dash id (the apiproxy mint)
+    // while its transcript already shows up in the scan under the OMP id —
+    // listing both renders one conversation as two sidebar rows. Hide the
+    // scan twin while the Dash session is live; it reappears under the OMP
+    // id once the agent is disposed and only the transcript remains.
+    const sessions = this.ctx.get("sessions") as SessionsSlice | undefined;
+    return [...scanOmpSessions().values()]
+      .filter((entry) => {
+        const dashId = readWebuiDashId(entry.ompSessionFile);
+        return dashId === undefined || sessions === undefined || sessions.get(SessionId(dashId)) === undefined;
+      })
+      .map((entry) => this.headerOf(entry));
   }
 
   async listSnapshots(signal?: AbortSignal): Promise<SessionPersistenceSnapshot[]> {

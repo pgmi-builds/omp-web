@@ -136,6 +136,48 @@ resume，都死在同一门禁上——已全部拆除，resume 收敛为 scan �
 ### 9.3 保留物：`webui.json.dashSessionId` 审计字段
 
 createAgent 仍写 per-session `webui.json`（P1 例外文件），内容从 `{permissionPreset}`
-扩为 `{dashSessionId, permissionPreset?}`。**无代码读取 dashSessionId**——它是盘上唯一
-的 Dash↔OMP 配对记录（事故取证用；2026-08-24 事故里恰好缺这条线索）。resume 语义只认
-preset 字段。
+扩为 `{dashSessionId, permissionPreset?}`。**同日修订**：§10.2 的 live-twin 去重成为
+dashSessionId 的第一个读取方（resume 语义仍只认 preset 字段）；它同时仍是盘上唯一的
+Dash↔OMP 配对取证记录。
+
+## 10. 同日修订（实施后复审，2026-08-24 下午）
+
+用户复审提出的两项修正 + 随之暴露的一个新事实，均已实施/验证：
+
+### 10.1 warmProjectionCache 全量拆除（boot + 60s）
+
+上游 WebUI 本就自愈：无 title 的行以 cwd basename 兜底显示（如 `.dsh`），用户点开后
+cold-read ladder（cached row → readFrom tail → restore → **durable write-back**）回填
+projection 行，下次列表即带真 title——3080 原生与 3081 桥接行为一致（实测确认）。
+预热的全部价值（未点开会话的侧栏 title 预填）不值得它的成本（每 60s 对变化会话全量
+replay transcript）。拆除后 smoke 发现机制同步改为 **transcript store 直查 marker**
+（store 即事实源，不再依赖 projection title）。
+
+### 10.2 list() live-twin 去重
+
+拆除预热后暴露的次生问题：bridge 会话 live 期间**同一会话出现两行**——live dash-id 行
+（上游 live registry）+ scan OMP-id 行（transcript 落盘即入列）。修正：`list()` 对
+webui.json 记录了 dashSessionId 且该 Dash 会话仍 live 的 scan 条目**隐藏**，agent
+disposal 后自动回归（OMP id 行）。list 仍为纯 scan 读 + 每条目一次 webui.json 读取，
+无新增持久状态。
+
+### 10.3 新事实：workspace 持久 attach 存的是短命 dash id
+
+原生 attach 流程在 apiproxy `create` 内（L2539 `workspace.attachSession(sessionId)`），
+存入 `workspace.json` 的是 **dash id**。agent 死亡（10min idle teardown，
+`OMP_IDLE_EXIT_MS` 默认 600_000）后该绑定随 live registry 一起失效——
+`sessionPath(dashId)` 无从解析 → 会话的 scan 行失去分组 → 落入 **Ungrouped（无 title，
+cwd basename 兜底）**。v0.0.2 的 boot-reconcile 一直在掩盖此点（它在重启时按 OMP id
+重挂）。v0.0.3 接受此形态：行仍可发现、可续聊（实测：Ungrouped 点击 → 历史回放 +
+title 自愈 + follow-up 完成），durable attach 应键持久 id 属上游语义，非桥接层职责——
+与 §7 第一行风险处置一致。
+
+### 10.4 用户原始 bug（"Cannot find Session ID"）终审
+
+机制链完整坐实：WebUI 新建会话 → apiproxy 铸 dash id → live 期间一切正常（live row +
+原生 workspace attach）→ **10min idle** 桥接层拆除 omp 子进程（资源必要性：每个 idle
+agent 钉死一个完整 `omp --mode rpc` 进程；上游注释"tearing down costs nothing
+observable"对 dash id 不成立）→ SPA 仍持 dash id → prompt → 上游门禁（§9.2）拒绝 →
+`session-not-found`。**桥接层无法修复**（dash id 到不了 factory）；自愈路径：刷新或经
+侧栏行（OMP id）重进，均实测通过。窗口可经 `OMP_IDLE_EXIT_MS` 调大，根因修复属上游
+（create 采纳 factory 注册 id，见 §9.1/§9.2）。

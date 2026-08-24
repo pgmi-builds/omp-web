@@ -138,11 +138,6 @@ if (!sessionId) {
   const state = JSON.parse(readFileSync(STATE_PATH, "utf8"));
   sessionId = state.sessionId;
   tok = state.tok;
-  // dev_0.0.3: the Dash session id (`session-<uuid4>`) and the OMP session id
-  // are unrelated; the cold list is keyed by the OMP id. phase2 locates the
-  // session by its title marker (exactly what a refreshed WebUI renders),
-  // resumes + follows up by that listed OMP id, and asserts the stale Dash
-  // id is cleanly rejected upstream (`session-not-found`).
 }
 
 // The instance may still be booting after the restart: poll session.list.
@@ -157,14 +152,36 @@ for (let i = 0; i < 60; i++) {
   await new Promise((r) => setTimeout(r, 2000));
 }
 const items = listed?.result?.value?.items ?? [];
-const titleOf = (item) => item?.projections?.values?.title ?? "";
-const row = tok !== undefined
-  ? items.find((item) => titleOf(item).includes(tok))
-  : items.find((item) => item.sessionId === sessionId);
-console.log(`session.list: ${items.length} item(s); target ${row ? `FOUND (${row.sessionId})` : "MISSING"}`);
-if (row && row.sessionId !== sessionId) console.log(`note: listed under OMP id ${row.sessionId} (Dash id ${sessionId} is post-restart stale)`);
 
-const listId = row?.sessionId ?? sessionId;
+// dev_0.0.3: the transcript store IS the source of truth. Find phase1's
+// session by its marker token in the store (same convention the bridge's
+// scan reads), then key everything off the OMP id the header record carries.
+let ompId;
+if (tok !== undefined) {
+  const { readdirSync } = await import("node:fs");
+  const STORE = `${process.env.HOME}/.omp/agent/sessions`;
+  outer: for (const dir of readdirSync(STORE)) {
+    let files;
+    try { files = readdirSync(`${STORE}/${dir}`); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith(".jsonl")) continue;
+      let raw;
+      try { raw = readFileSync(`${STORE}/${dir}/${f}`, "utf8"); } catch { continue; }
+      if (!raw.includes(tok)) continue;
+      const m = raw.match(/"type":"session","version":\d+,"id":"([^"]+)"/);
+      if (m !== null) { ompId = m[1]; break outer; }
+    }
+  }
+}
+const listId = ompId ?? sessionId;
+const row = items.find((item) => item.sessionId === listId);
+console.log(`session.list: ${items.length} item(s); target ${row ? `FOUND (${row.sessionId})` : "MISSING"}`);
+if (ompId !== undefined && ompId !== sessionId) console.log(`note: dash ${sessionId} ↔ omp ${ompId} (post-restart the OMP id is the only live key)`);
+if (tok !== undefined && ompId === undefined) {
+  console.error("FAIL: marker token not found in the transcript store");
+  process.exit(1);
+}
+
 let lines = await historyLines(listId);
 console.log("--- cold history (pre-resume, by listed OMP id) ---");
 for (const l of lines) console.log(l);
@@ -195,7 +212,7 @@ const count = (prefix) => final.filter((l) => l.startsWith(prefix)).length;
 const userMsgs = final.filter((l) => l === "user/message").length;
 const assistantMsgs = final.filter((l) => l.startsWith("assistant/message")).length;
 const checks = [
-  ["session.list finds the session (by title marker)", row !== undefined],
+  ["session.list finds the session (by OMP id from transcript store)", row !== undefined],
   ["stale Dash id cleanly rejected", stale.result?.error?.code === "session-not-found"],
   ["cold history has ≥2 user/message", lines.filter((l) => l === "user/message").length >= 2],
   ["cold history has ≥2 assistant/message", lines.filter((l) => l.startsWith("assistant/message")).length >= 2],

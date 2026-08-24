@@ -189,6 +189,24 @@ export interface WebuiArtifactFields {
   readonly preset?: string;
 }
 
+/** Read the persisted Dash session id; undefined when absent/unreadable. */
+export function readWebuiDashId(sessionFile: string): string | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(webuiArtifactPath(sessionFile), "utf8");
+  } catch {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed === null || typeof parsed !== "object") return undefined;
+    const dashId = (parsed as Record<string, unknown>)["dashSessionId"];
+    return typeof dashId === "string" && dashId.length > 0 ? dashId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 
 /**
  * Persist the webui artifact atomically (tmp file + rename), best-effort:

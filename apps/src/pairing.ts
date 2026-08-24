@@ -8,14 +8,16 @@
  *   - Bridge-created sessions carry the REAL Dash id in their per-session
  *     `webui.json` (`dashSessionId`, written once at createAgent).
  *   - Every other OMP session (TUI-born, or predating the pairing field)
- *     gets a STATELESS derived id: `session-` + the OMP uuidv7. The uuid
+ *     gets a deterministic derived id: `session-` + the OMP uuidv7. The uuid
  *     version nibble (7 ≠ 4) makes collisions with apiproxy-minted ids
- *     impossible, and no write is needed — the formula is frozen.
+ *     impossible. The derived id is ALSO persisted to webui.json on first
+ *     sight, so the pairing is durable data (auditable, uniform with
+ *     bridge-created sessions), not a runtime formula.
  *
  * All id translation happens at the persistence/factory boundary; inside the
  * bridge everything stays keyed by the scanned OMP entry.
  */
-import { readWebuiDashId } from "./permission.js";
+import { readWebuiDashId, writeWebuiDashId } from "./permission.js";
 import { scanOmpSessions, type OmpNativeSession } from "./omp-store.js";
 
 /** The Dash-format prefix apiproxy mints; derived ids reuse it verbatim. */
@@ -23,7 +25,11 @@ const DASH_PREFIX = "session-";
 
 /** The Dash-facing id for one scanned OMP session (real pairing or derived). */
 export function dashIdOf(entry: OmpNativeSession): string {
-  return readWebuiDashId(entry.ompSessionFile) ?? `${DASH_PREFIX}${entry.ompSessionId}`;
+  const existing = readWebuiDashId(entry.ompSessionFile);
+  if (existing !== undefined) return existing;
+  const derived = `${DASH_PREFIX}${entry.ompSessionId}`;
+  writeWebuiDashId(entry.ompSessionFile, derived);
+  return derived;
 }
 
 /**

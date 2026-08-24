@@ -211,8 +211,7 @@ export function readWebuiDashId(sessionFile: string): string | undefined {
 /**
  * Persist the webui artifact atomically (tmp file + rename), best-effort:
  * failures are traced and swallowed — a lost artifact only degrades
- * cold-replay fidelity, never the live session. `dashSessionId` is audit
- * metadata (the only durable Dash↔OMP pairing record); no code reads it.
+ * cold-replay fidelity, never the live session.
  */
 export function writeWebuiArtifact(sessionFile: string, fields: WebuiArtifactFields): void {
   const artifact = webuiArtifactPath(sessionFile);
@@ -233,4 +232,16 @@ export function writeWebuiArtifact(sessionFile: string, fields: WebuiArtifactFie
   } catch (error) {
     trace(`write: ${artifact} FAILED ${String(error)}`);
   }
+}
+
+/**
+ * Persist the Dash pairing for a session that has none yet (a TUI-born OMP
+ * session receiving its derived dash id), preserving any existing preset.
+ * The value is the deterministic `session-<ompId>`, so concurrent/repeated
+ * calls write identical content — idempotent, best-effort, fail-soft.
+ */
+export function writeWebuiDashId(sessionFile: string, dashId: string): void {
+  if (readWebuiDashId(sessionFile) === dashId) return;
+  const preset = readWebuiPreset(sessionFile);
+  writeWebuiArtifact(sessionFile, { dashSessionId: dashId, ...(preset === undefined ? {} : { preset }) });
 }

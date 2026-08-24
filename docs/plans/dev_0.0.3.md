@@ -181,3 +181,50 @@ observable"对 dash id 不成立）→ SPA 仍持 dash id → prompt → 上游�
 `session-not-found`。**桥接层无法修复**（dash id 到不了 factory）；自愈路径：刷新或经
 侧栏行（OMP id）重进，均实测通过。窗口可经 `OMP_IDLE_EXIT_MS` 调大，根因修复属上游
 （create 采纳 factory 注册 id，见 §9.1/§9.2）。
+
+
+## 11. 同日二次修订：dash-id 边界统一（用户设计复审采纳）
+
+用户提案：既然 id 异构不可根除，就把摩擦全部收进桥接层——**上游（含 WebUI）只见
+dash 形态 id，OMP id 对上游所有 method 完全透明**。评审结论：成立，且优于 §10.2 的
+live-twin 去重补丁（该 hack 已被自然消解删除）。已实施：
+
+### 11.1 配对规则（`apps/src/pairing.ts`）
+
+- bridge 创建的会话：webui.json `dashSessionId`（createAgent 落盘的真实 dash id）
+- 其余 OMP 会话（TUI 出生 / 早于配对字段）：**无状态派生** `session-` + OMP uuidv7。
+  uuid 版本位 7≠4 保证与 apiproxy 铸的 uuid4 永不冲突；公式冻结，无需写盘
+- 解析（`resolveEntryById`）：派生剥前缀直查 scan → 真实 dash id 反查 webui.json →
+  裸 OMP id 兜底（宽容内部调用方）
+
+### 11.2 边界改造
+
+- `session-persistence-omp.ts`：所有对外 id（header/list/snapshot/raw）一律 dash 面
+  （`dashIdOf`）；所有入参 id 经 `resolveEntryById` 翻译回 scan 条目。
+  **§10.2 的 webui.json 反查去重删除**——live 行与 scan 行现为同一 id，上游
+  `attached` 过滤天然折叠，双行问题从根上消失
+- `index.ts` resume：`scanOmpSessions().get(id)` → `resolveEntryById(id)`
+- **boot 预热恢复**（用户点 1）：一次性 pass，按 dash 面 id 预填全部 projection 行
+  （首屏真 title，避免同 workspace 下十行同名 path 兜底）；无 60s 周期——title
+  自愈（§10.1）使周期不必要
+
+### 11.3 连锁修复（全部实测）
+
+| 面 | 结果 |
+|---|---|
+| **原始 bug（stale dash id 跨重启）** | prompt 被接受、两轮续聊完成——曾经必现的 `session-not-found` 消失 |
+| §10.3 死后会话脱组 | durable attach（存的 dash id）现在可解析 → 会话**留在工作区分组**（navgap 实测回归 dsh-omp 组） |
+| 双行 transient | id 统一后结构性消失 |
+| TUI 会话 | 以派生 id 列出 + 可 resume（实测 turn 3 完成） |
+| 一次性迁移 | workspace.json 24 条绑定 re-key 为 dash 面 id；projcache 重置（纯缓存，boot 重建）；配对面 7 paired + 51 derived |
+| smoke | 12/12（stale-dash 拒绝断言随语义翻转移除；dash id 恒等成为主断言） |
+
+### 11.4 遗留边界（如实记录）
+
+- 迁移前 WebUI 旧标签页攥的 **OMP id** 会在门禁死掉（list 已不含 OMP id）——一次性
+  过渡成本，刷新即愈
+- OMP transcript 需 turn 结束才落盘：create 后立即杀服务（turn 未完）会丢该会话
+  （webui.json 在、jsonl 不在 → scan 不见 → 干净 not-found）。属 OMP 落盘时序，
+  桥接层不补写
+- 派生公式 `session-<ompId>` 冻结为合同；上游若改 id 形态，桥接层零改动（§9 系列
+  结论的延续）

@@ -87,15 +87,11 @@ if (phase === "phase1") {
   }
   console.log("sessionId:", sessionId);
 
-  // Unique title marker: phase2 locates this session in the cold list by it
-  // (exactly how a refreshed WebUI finds the row — the list is scan-keyed by
-  // the OMP id, NOT the Dash id phase1 holds).
-  const TOK = `dsh003-${Math.random().toString(16).slice(2, 8)}`;
   const t0 = Date.now();
   const p1 = await call("session.prompt", {
     sessionId,
     mode: "queue",
-    content: [{ type: "text", text: `[${TOK}] Reply with exactly: ping1` }],
+    content: [{ type: "text", text: "Reply with exactly: ping1" }],
   });
   console.log("prompt1:", JSON.stringify(p1.result), `t+${Date.now() - t0}ms`);
   let lines = await waitFor(sessionId, (ls) => ls.some((l) => l.startsWith("turn/end turn=1")));
@@ -120,7 +116,7 @@ if (phase === "phase1") {
 
   console.log("--- pre-restart history ---");
   for (const l of lines) console.log(l);
-  writeFileSync(STATE_PATH, JSON.stringify({ sessionId, tok: TOK, base: BASE }, null, 2));
+  writeFileSync(STATE_PATH, JSON.stringify({ sessionId, base: BASE }, null, 2));
   console.log(`\nphase1 done. Now fully STOP and restart dsh (hub stop/start on the smoke instance), then run:`);
   console.log(`  node docs/smoke-resume.mjs phase2`);
   process.exit(0);
@@ -133,11 +129,9 @@ if (phase !== "phase2") {
 }
 
 let sessionId = process.argv[4];
-let tok;
 if (!sessionId) {
   const state = JSON.parse(readFileSync(STATE_PATH, "utf8"));
   sessionId = state.sessionId;
-  tok = state.tok;
 }
 
 // The instance may still be booting after the restart: poll session.list.
@@ -153,67 +147,35 @@ for (let i = 0; i < 60; i++) {
 }
 const items = listed?.result?.value?.items ?? [];
 
-// dev_0.0.3: the transcript store IS the source of truth. Find phase1's
-// session by its marker token in the store (same convention the bridge's
-// scan reads), then key everything off the OMP id the header record carries.
-let ompId;
-if (tok !== undefined) {
-  const { readdirSync } = await import("node:fs");
-  const STORE = `${process.env.HOME}/.omp/agent/sessions`;
-  outer: for (const dir of readdirSync(STORE)) {
-    let files;
-    try { files = readdirSync(`${STORE}/${dir}`); } catch { continue; }
-    for (const f of files) {
-      if (!f.endsWith(".jsonl")) continue;
-      let raw;
-      try { raw = readFileSync(`${STORE}/${dir}/${f}`, "utf8"); } catch { continue; }
-      if (!raw.includes(tok)) continue;
-      const m = raw.match(/"type":"session","version":\d+,"id":"([^"]+)"/);
-      if (m !== null) { ompId = m[1]; break outer; }
-    }
-  }
-}
-const listId = ompId ?? sessionId;
-const row = items.find((item) => item.sessionId === listId);
-console.log(`session.list: ${items.length} item(s); target ${row ? `FOUND (${row.sessionId})` : "MISSING"}`);
-if (ompId !== undefined && ompId !== sessionId) console.log(`note: dash ${sessionId} ↔ omp ${ompId} (post-restart the OMP id is the only live key)`);
-if (tok !== undefined && ompId === undefined) {
-  console.error("FAIL: marker token not found in the transcript store");
-  process.exit(1);
-}
+// dev_0.0.3 §11: the Dash session id IS the durable key. The pairing
+// (webui.json twin-embedding) makes it resumable across restarts — this is
+// the exact stale-tab scenario that used to fail with "Cannot find Session
+// ID", now the primary assertion.
+const row = items.find((item) => item.sessionId === sessionId);
+console.log(`session.list: ${items.length} item(s); dash id row ${row ? "FOUND" : "MISSING"}`);
 
-let lines = await historyLines(listId);
-console.log("--- cold history (pre-resume, by listed OMP id) ---");
+let lines = await historyLines(sessionId);
+console.log("--- cold history (pre-resume, by Dash id) ---");
 for (const l of lines) console.log(l);
 
-// Boundary (documented dev_0.0.3 behavior): the stale Dash id is rejected
-// cleanly upstream (`session-not-found`) — the API only routes ids the
-// persistence lists, which after a restart are the OMP ids.
-const stale = await call("session.prompt", {
-  sessionId,
-  mode: "queue",
-  content: [{ type: "text", text: "should not run" }],
-});
-console.log("stale Dash id prompt:", JSON.stringify(stale.result?.error?.code ?? stale.result));
-
 const p3 = await call("session.prompt", {
-  sessionId: listId,
+  sessionId,
   mode: "queue",
   content: [{ type: "text", text: "Reply with exactly: resumed3" }],
 });
-console.log("prompt3 (by listed OMP id):", JSON.stringify(p3.result));
+console.log("prompt3 (by Dash id, post-restart):", JSON.stringify(p3.result));
 
-const final = await waitFor(listId, (ls) => ls.some((l) => l.startsWith("turn/end turn=3")));
-console.log("--- post-resume history (by listed OMP id) ---");
+const final = await waitFor(sessionId, (ls) => ls.some((l) => l.startsWith("turn/end turn=3")));
+console.log("--- post-resume history (by Dash id) ---");
 for (const l of final) console.log(l);
+
 
 
 const count = (prefix) => final.filter((l) => l.startsWith(prefix)).length;
 const userMsgs = final.filter((l) => l === "user/message").length;
 const assistantMsgs = final.filter((l) => l.startsWith("assistant/message")).length;
 const checks = [
-  ["session.list finds the session (by OMP id from transcript store)", row !== undefined],
-  ["stale Dash id cleanly rejected", stale.result?.error?.code === "session-not-found"],
+  ["session.list carries the Dash id row (durable pairing)", row !== undefined],
   ["cold history has ≥2 user/message", lines.filter((l) => l === "user/message").length >= 2],
   ["cold history has ≥2 assistant/message", lines.filter((l) => l.startsWith("assistant/message")).length >= 2],
   ["cold history numbers turns 1..2", lines.some((l) => l.startsWith("turn/start turn=1")) && lines.some((l) => l.startsWith("turn/start turn=2"))],

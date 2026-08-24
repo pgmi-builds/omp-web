@@ -15,6 +15,10 @@
  * history) folds off the events this service returns and checkpoints live
  * sessions itself. Legacy jsonl logs from earlier phases stay on disk
  * untouched but are never read or written.
+ *
+ * dev_0.0.3 §11: every id this service hands upstream (headers, snapshots,
+ * raw exports) is the DASH-facing id (pairing.ts) — OMP ids never leave the
+ * bridge. All inbound ids translate back through the same pairing.
  */
 import { readFileSync, statSync } from "node:fs";
 import { basename } from "node:path";
@@ -37,11 +41,12 @@ import {
 } from "@deepseek-ai/dsh-session";
 import { readOmpMessages, scanOmpSessions, type OmpNativeSession } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
-import { isPresetName, permissionEventsFor, readWebuiDashId, readWebuiPreset, statWebuiArtifact, type WebuiStat } from "./permission.js";
+import { isPresetName, permissionEventsFor, readWebuiPreset, statWebuiArtifact, type WebuiStat } from "./permission.js";
+import { dashIdOf, resolveEntryById } from "./pairing.js";
 
-/** The slice of `ctx.sessions` the list live-twin de-dup reads. */
-interface SessionsSlice {
-  get(id: SessionId): unknown;
+/** The slice of `ctx.sessionProjectionCache` the boot warm pass reads. */
+interface ProjectionCacheSlice {
+  coldSnapshot(id: SessionId, signal?: AbortSignal): Promise<unknown>;
 }
 
 /** Memoized replayed Dash logs, keyed by session file path + (size, mtime) of the transcript and the webui.json artifact. */
@@ -58,18 +63,45 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
 
   constructor(ctx: Context) {
     super(ctx);
+    this.warmProjectionCacheOnce();
   }
 
-  /** The scanned entry for an id, when OMP's store owns it. */
+  /**
+   * One-shot boot pass: pre-fill the host's durable projection rows (sidebar
+   * titles/stats) for every scanned session under its DASH id, so the first
+   * WebUI landing renders real titles instead of cwd-basename fallbacks —
+   * rows grouped under one workspace would otherwise all show the same path
+   * name. No periodic repeat: titles self-heal through the cold-read ladder
+   * when a session is opened, and replaying every changed transcript on a
+   * timer is churn the self-heal makes unnecessary.
+   */
+  private warmProjectionCacheOnce(): void {
+    this.ctx.inject(["sessionProjectionCache"], (warmCtx) => {
+      const cache = warmCtx.get("sessionProjectionCache") as ProjectionCacheSlice | undefined;
+      if (cache === undefined) return;
+      void (async () => {
+        for (const entry of scanOmpSessions().values()) {
+          try {
+            await cache.coldSnapshot(SessionId(dashIdOf(entry)));
+          } catch {
+            // Fail-soft per session: an unreadable transcript degrades that
+            // row's projections until opened, never the boot.
+          }
+        }
+      })();
+    });
+  }
+
+  /** The scanned entry a Dash-facing id resolves to, when the store owns it. */
   private nativeOf(id: string): OmpNativeSession | undefined {
-    return scanOmpSessions().get(id);
+    return resolveEntryById(id);
   }
 
   /** Dash header for one scanned-native session. */
   private headerOf(entry: OmpNativeSession): SessionHeader {
     return Object.freeze({
       version: SESSION_FORMAT_VERSION,
-      id: SessionId(entry.ompSessionId),
+      id: SessionId(dashIdOf(entry)),
       createdAt: entry.createdAt,
       // The chat-header preset badge resolves session.header.agentPreset
       // (or a later agent-preset/selected event). OMP is single-mode, so every
@@ -136,18 +168,10 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
 
   async list(signal?: AbortSignal): Promise<SessionHeader[]> {
     signal?.throwIfAborted();
-    // A bridge-created session is LIVE under its Dash id (the apiproxy mint)
-    // while its transcript already shows up in the scan under the OMP id —
-    // listing both renders one conversation as two sidebar rows. Hide the
-    // scan twin while the Dash session is live; it reappears under the OMP
-    // id once the agent is disposed and only the transcript remains.
-    const sessions = this.ctx.get("sessions") as SessionsSlice | undefined;
-    return [...scanOmpSessions().values()]
-      .filter((entry) => {
-        const dashId = readWebuiDashId(entry.ompSessionFile);
-        return dashId === undefined || sessions === undefined || sessions.get(SessionId(dashId)) === undefined;
-      })
-      .map((entry) => this.headerOf(entry));
+    // Dash-facing ids only: bridge sessions list under their real Dash id
+    // (so the live row and this cold row are the SAME id and upstream's
+    // attached-filter folds them), everything else under its derived id.
+    return [...scanOmpSessions().values()].map((entry) => this.headerOf(entry));
   }
 
   async listSnapshots(signal?: AbortSignal): Promise<SessionPersistenceSnapshot[]> {

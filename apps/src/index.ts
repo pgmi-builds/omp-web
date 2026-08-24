@@ -38,7 +38,8 @@ import { replayOmpMessages } from "./replay.js";
 import { OmpLlmAdapter } from "./adapter.js";
 import { OmpUnionSessionPersistence } from "./session-persistence-omp.js";
 import { SingleOmpPresetRoster } from "./agent-preset-omp.js";
-import { cwdFromSessionFile, OMP_SESSIONS_ROOT, scanOmpSessions } from "./omp-store.js";
+import { resolveEntryById } from "./pairing.js";
+import { cwdFromSessionFile, OMP_SESSIONS_ROOT } from "./omp-store.js";
 import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents, readWebuiPreset, writeWebuiArtifact } from "./permission.js";
 import { ompProviderIds } from "./models.js";
 
@@ -158,13 +159,12 @@ export class OmpProvider extends Service implements AgentFactory {
     const loopCtx = this.runtime.ctx;
     const id = options.resumeSessionId;
 
-    // Identity (dev_0.0.3): the store scan is the single source of truth.
-    // Every resumable id IS an OMP id — the API resolver only routes ids the
-    // persistence lists (which the scan feeds), so a miss here is a genuine
-    // unknown, fail-closed. Dash-minted ids (`session-<uuid4>`) are rejected
-    // upstream with `session-not-found` before this point; their OMP
-    // sessions stay resumable under the OMP id the list shows.
-    const record = scanOmpSessions().get(id);
+    // Identity (dev_0.0.3 §11): translate the Dash-facing id (real Dash id
+    // via the webui.json pairing, or a stateless derived id) back to its
+    // scanned OMP entry. The API resolver only routes ids the persistence
+    // lists — which are exactly these Dash-facing ids — so a miss here is a
+    // genuine unknown, fail-closed.
+    const record = resolveEntryById(id);
     trace(`resume id=${id} record=${record === undefined ? "MISSING" : record.ompSessionFile}`);
     if (record === undefined) {
       throw new Error(`cannot resume session "${id}": no OMP session is recorded for this Dash session id`);

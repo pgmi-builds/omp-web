@@ -87,11 +87,15 @@ if (phase === "phase1") {
   }
   console.log("sessionId:", sessionId);
 
+  // Unique title marker: phase2 locates this session in the cold list by it
+  // (exactly how a refreshed WebUI finds the row — the list is scan-keyed by
+  // the OMP id, NOT the Dash id phase1 holds).
+  const TOK = `dsh003-${Math.random().toString(16).slice(2, 8)}`;
   const t0 = Date.now();
   const p1 = await call("session.prompt", {
     sessionId,
     mode: "queue",
-    content: [{ type: "text", text: "Reply with exactly: ping1" }],
+    content: [{ type: "text", text: `[${TOK}] Reply with exactly: ping1` }],
   });
   console.log("prompt1:", JSON.stringify(p1.result), `t+${Date.now() - t0}ms`);
   let lines = await waitFor(sessionId, (ls) => ls.some((l) => l.startsWith("turn/end turn=1")));
@@ -116,7 +120,7 @@ if (phase === "phase1") {
 
   console.log("--- pre-restart history ---");
   for (const l of lines) console.log(l);
-  writeFileSync(STATE_PATH, JSON.stringify({ sessionId, base: BASE }, null, 2));
+  writeFileSync(STATE_PATH, JSON.stringify({ sessionId, tok: TOK, base: BASE }, null, 2));
   console.log(`\nphase1 done. Now fully STOP and restart dsh (hub stop/start on the smoke instance), then run:`);
   console.log(`  node docs/smoke-resume.mjs phase2`);
   process.exit(0);
@@ -129,18 +133,16 @@ if (phase !== "phase2") {
 }
 
 let sessionId = process.argv[4];
+let tok;
 if (!sessionId) {
   const state = JSON.parse(readFileSync(STATE_PATH, "utf8"));
   sessionId = state.sessionId;
-  // Phase C: Dash-side session.jsonl is gone; after a restart the session is
-  // listed under its OMP session id. Translate via the wrapper's mapping.
-  const DASH_HOME = process.env.DSH_HOME ?? `${process.env.HOME ?? ""}/.omp/dsh`;
-  const index = JSON.parse(readFileSync(`${DASH_HOME}/omp-sessions.json`, "utf8"));
-  const ompId = index[sessionId]?.ompSessionId;
-  if (ompId) {
-    console.log(`dash id ${sessionId} -> omp id ${ompId} (replay-persisted)`);
-    sessionId = ompId;
-  }
+  tok = state.tok;
+  // dev_0.0.3: the Dash session id (`session-<uuid4>`) and the OMP session id
+  // are unrelated; the cold list is keyed by the OMP id. phase2 locates the
+  // session by its title marker (exactly what a refreshed WebUI renders),
+  // resumes + follows up by that listed OMP id, and asserts the stale Dash
+  // id is cleanly rejected upstream (`session-not-found`).
 }
 
 // The instance may still be booting after the restart: poll session.list.
@@ -155,29 +157,46 @@ for (let i = 0; i < 60; i++) {
   await new Promise((r) => setTimeout(r, 2000));
 }
 const items = listed?.result?.value?.items ?? [];
-const row = items.find((item) => item.sessionId === sessionId);
-console.log(`session.list: ${items.length} item(s); target ${row ? "FOUND" : "MISSING"}`);
+const titleOf = (item) => item?.projections?.values?.title ?? "";
+const row = tok !== undefined
+  ? items.find((item) => titleOf(item).includes(tok))
+  : items.find((item) => item.sessionId === sessionId);
+console.log(`session.list: ${items.length} item(s); target ${row ? `FOUND (${row.sessionId})` : "MISSING"}`);
+if (row && row.sessionId !== sessionId) console.log(`note: listed under OMP id ${row.sessionId} (Dash id ${sessionId} is post-restart stale)`);
 
-let lines = await historyLines(sessionId);
-console.log("--- cold history (pre-resume) ---");
+const listId = row?.sessionId ?? sessionId;
+let lines = await historyLines(listId);
+console.log("--- cold history (pre-resume, by listed OMP id) ---");
 for (const l of lines) console.log(l);
 
-const p3 = await call("session.prompt", {
+// Boundary (documented dev_0.0.3 behavior): the stale Dash id is rejected
+// cleanly upstream (`session-not-found`) — the API only routes ids the
+// persistence lists, which after a restart are the OMP ids.
+const stale = await call("session.prompt", {
   sessionId,
+  mode: "queue",
+  content: [{ type: "text", text: "should not run" }],
+});
+console.log("stale Dash id prompt:", JSON.stringify(stale.result?.error?.code ?? stale.result));
+
+const p3 = await call("session.prompt", {
+  sessionId: listId,
   mode: "queue",
   content: [{ type: "text", text: "Reply with exactly: resumed3" }],
 });
-console.log("prompt3:", JSON.stringify(p3.result));
+console.log("prompt3 (by listed OMP id):", JSON.stringify(p3.result));
 
-const final = await waitFor(sessionId, (ls) => ls.some((l) => l.startsWith("turn/end turn=3")));
-console.log("--- post-resume history ---");
+const final = await waitFor(listId, (ls) => ls.some((l) => l.startsWith("turn/end turn=3")));
+console.log("--- post-resume history (by listed OMP id) ---");
 for (const l of final) console.log(l);
+
 
 const count = (prefix) => final.filter((l) => l.startsWith(prefix)).length;
 const userMsgs = final.filter((l) => l === "user/message").length;
 const assistantMsgs = final.filter((l) => l.startsWith("assistant/message")).length;
 const checks = [
-  ["session.list finds the session", row !== undefined],
+  ["session.list finds the session (by title marker)", row !== undefined],
+  ["stale Dash id cleanly rejected", stale.result?.error?.code === "session-not-found"],
   ["cold history has ≥2 user/message", lines.filter((l) => l === "user/message").length >= 2],
   ["cold history has ≥2 assistant/message", lines.filter((l) => l.startsWith("assistant/message")).length >= 2],
   ["cold history numbers turns 1..2", lines.some((l) => l.startsWith("turn/start turn=1")) && lines.some((l) => l.startsWith("turn/start turn=2"))],

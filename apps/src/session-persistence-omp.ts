@@ -35,7 +35,6 @@ import {
   type SessionEvent,
   type SessionHeader,
 } from "@deepseek-ai/dsh-session";
-import { sessionIndex } from "./session-index.js";
 import { readOmpMessages, scanOmpSessions, type OmpNativeSession } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
 import { isPresetName, permissionEventsFor, readWebuiPreset, statWebuiArtifact, type WebuiStat } from "./permission.js";
@@ -63,22 +62,7 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
 
   constructor(ctx: Context) {
     super(ctx);
-    void this.seedSessionIndex();
     this.warmProjectionCache();
-  }
-
-  /** Idempotently seed the Dash→OMP resume index for scanned-native sessions. */
-  private async seedSessionIndex(): Promise<void> {
-    const known = sessionIndex.load();
-    for (const entry of scanOmpSessions().values()) {
-      if (known[entry.ompSessionId] !== undefined) continue;
-      await sessionIndex.put(entry.ompSessionId, {
-        ompSessionId: entry.ompSessionId,
-        ompSessionFile: entry.ompSessionFile,
-        ...(entry.cwd === undefined ? {} : { cwd: entry.cwd }),
-        createdAt: entry.createdAt,
-      });
-    }
   }
 
   /**

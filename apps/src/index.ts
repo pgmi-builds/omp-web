@@ -32,16 +32,14 @@ import type {
 import { emitAgentEvent } from "@deepseek-ai/dsh-agent";
 import { SessionPreparation, type SessionEvent, type SessionId } from "@deepseek-ai/dsh-session";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
-import type { WorkspaceRegistry } from "@deepseek-ai/dsh-workspace";
 import { OmpRpcClient } from "./rpc.js";
 import { OmpAgent } from "./agent.js";
 import { replayOmpMessages } from "./replay.js";
-import { sessionIndex } from "./session-index.js";
 import { OmpLlmAdapter } from "./adapter.js";
 import { OmpUnionSessionPersistence } from "./session-persistence-omp.js";
 import { SingleOmpPresetRoster } from "./agent-preset-omp.js";
 import { cwdFromSessionFile, OMP_SESSIONS_ROOT, scanOmpSessions } from "./omp-store.js";
-import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents, readWebuiPreset, writeWebuiPreset } from "./permission.js";
+import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents, readWebuiPreset, writeWebuiArtifact } from "./permission.js";
 import { ompProviderIds } from "./models.js";
 
 /** Realpath of a recorded cwd, accepted only when it names an existing directory. */
@@ -90,65 +88,7 @@ export class OmpProvider extends Service implements AgentFactory {
     // they load with this plugin — before any dependent service initializes.
     ctx.plugin(OmpUnionSessionPersistence);
     ctx.plugin(SingleOmpPresetRoster);
-    this.#reconcileWorkspaces();
   }
-
-  /**
-   * Derive the Workspace sidebar from the scanned OMP cwds. The registry
-   * bootstraps from `sessionPersistence.list()` only once (its durable state
-   * is already initialized), so native-only workspaces are created and their
-   * sessions attached here — idempotently, on every boot. cwds under the OMP
-   * home itself stay ungrouped: those records are deleted when present, which
-   * leaves their sessions as sidebar strays in the "Ungrouped" bucket.
-   */
-  #reconcileWorkspaces(): void {
-    this.runtime.ctx.inject(["workspaceRegistry"], async (wctx) => {
-      const registry = (wctx as unknown as { workspaceRegistry: WorkspaceRegistry }).workspaceRegistry;
-      try {
-        const ungroupedPaths = new Set(
-          [process.env.OMP_HOME ?? join(homedir(), ".omp"), process.env.DSH_HOME ?? join(homedir(), ".omp/dsh")]
-            .map((path) => realpathSync(path))
-            .filter((path) => path !== undefined),
-        );
-        const groups = new Map<string, string[]>();
-        for (const entry of scanOmpSessions().values()) {
-          if (entry.cwd === undefined) continue;
-          let canonical: string | undefined;
-          try {
-            canonical = realpathSync(entry.cwd);
-            if (!statSync(canonical).isDirectory()) canonical = undefined;
-          } catch {
-            canonical = undefined;
-          }
-          if (canonical === undefined || ungroupedPaths.has(canonical)) continue;
-          const ids = groups.get(canonical);
-          if (ids === undefined) groups.set(canonical, [entry.ompSessionId]);
-          else if (!ids.includes(entry.ompSessionId)) ids.push(entry.ompSessionId);
-        }
-        for (const [path, ids] of groups) {
-          const existing = await registry.resolveByPath(path);
-          const workspace = existing ?? (await registry.create(path));
-          for (const id of ids) {
-            if (!workspace.sessionIds.some((accounted) => accounted === (id as never))) {
-              await workspace.attachSession(id as never);
-            }
-          }
-        }
-        for (const workspace of registry.list()) {
-          // Prune any registry workspace the current scan no longer backs:
-          // OMP-home paths (ungrouped by design) and paths with zero scanned
-          // sessions (test workspaces whose transcripts were deleted on disk).
-          // Without this the persisted registry keeps showing stale entries.
-          if (ungroupedPaths.has(workspace.path) || !groups.has(workspace.path)) {
-            await registry.delete(workspace.id);
-          }
-        }
-      } catch (error) {
-        wctx.logger.warn(`omp-provider: workspace reconciliation failed: ${String(error)}`);
-      }
-    });
-  }
-
 
   /**
    * Register the OMP-backed LLM adapter so the browser model selector (an RPC
@@ -188,21 +128,15 @@ export class OmpProvider extends Service implements AgentFactory {
     const rpc = await OmpRpcClient.spawn(["--approval-mode", approvalMode], cwd);
 
     try {
-      // Capture OMP's session identity so resume can recover it later.
+      // The Dash session id and OMP's session id are UNRELATED (Dash mints
+      // `session-<uuid4>`, OMP its own uuidv7). Their pairing lives in the one
+      // per-session artifact the bridge owns inside OMP's store (webui.json):
+      // a Dash-id resume reads it back through the scan, and the preset
+      // travels with it for cold permission synthesis. Best-effort contract.
       const state = await rpc.getState();
 
-      if (state.sessionId !== undefined && state.sessionFile !== undefined) {
-        await sessionIndex.put(id, {
-          ompSessionId: state.sessionId,
-          ompSessionFile: state.sessionFile,
-          ...(cwd === undefined ? {} : { cwd }),
-          createdAt: Date.now(),
-        });
-
-        // Persist the Dash-side preset next to OMP's transcript: cold reads
-        // synthesize the permission events from it after wrapper restarts,
-        // and resume re-derives the spawn flag. Best-effort by contract.
-        if (preset !== undefined) writeWebuiPreset(state.sessionFile, preset);
+      if (state.sessionFile !== undefined) {
+        writeWebuiArtifact(state.sessionFile, { dashSessionId: id, ...(preset === undefined ? {} : { preset }) });
       }
 
       // Prepare the unpublished session (mirrors dsh-agent-loop's SessionPreparation).
@@ -224,17 +158,21 @@ export class OmpProvider extends Service implements AgentFactory {
     const loopCtx = this.runtime.ctx;
     const id = options.resumeSessionId;
 
-    // Recover the OMP session identity recorded at createAgent time (or seeded
-    // from the store scan for TUI-created sessions).
-    const record = sessionIndex.get(id);
+    // Identity (dev_0.0.3): the store scan is the single source of truth.
+    // Every resumable id IS an OMP id — the API resolver only routes ids the
+    // persistence lists (which the scan feeds), so a miss here is a genuine
+    // unknown, fail-closed. Dash-minted ids (`session-<uuid4>`) are rejected
+    // upstream with `session-not-found` before this point; their OMP
+    // sessions stay resumable under the OMP id the list shows.
+    const record = scanOmpSessions().get(id);
     trace(`resume id=${id} record=${record === undefined ? "MISSING" : record.ompSessionFile}`);
     if (record === undefined) {
       throw new Error(`cannot resume session "${id}": no OMP session is recorded for this Dash session id`);
     }
 
-    // The session file must live inside OMP's native store — the mapping JSON
-    // is user-writable, so its path field alone must not aim a resume at an
-    // arbitrary file outside the store.
+    // The session file must live inside OMP's native store — the scanned
+    // entry's path is OMP-authored, but re-realpath and re-verify so a store
+    // mutated underneath the scan cannot aim a resume outside it.
     let sessionFile: string;
     try {
       sessionFile = realpathSync(record.ompSessionFile);
@@ -245,19 +183,15 @@ export class OmpProvider extends Service implements AgentFactory {
       throw new Error(`cannot resume session "${id}": recorded OMP session file is unusable (${String(error)})`);
     }
 
-    // Refuse to spawn OMP for a session this profile's persistence does not
-    // serve (the scan must still list it — files deleted out from under the
-    // mapping must not be resumable).
+    // The union persistence serves exactly the ids the scan lists, so this
+    // resume is always persistence-served in this profile; the RPC-replay
+    // branch below only guards a persistence-less composition.
     const persistence = loopCtx.get("sessionPersistence") as SessionPersistenceSlice | undefined;
-    const persisted =
-      persistence !== undefined && (await persistence.list()).some((header) => header.id === id);
-    trace(`resume id=${id} persisted=${persisted}`);
     // Spawn cwd is derived from the session's LOCATION in OMP's store (the
     // dashed parent directory), never the mapping's verbatim cwd field; the
     // header-record cwd (also OMP-authored, inside the file) is the fallback
     // for stores whose directory names predate the flattening convention.
-    const scanEntry = scanOmpSessions().get(id);
-    const spawnCwd = cwdFromSessionFile(sessionFile) ?? validatedCwd(scanEntry?.cwd);
+    const spawnCwd = cwdFromSessionFile(sessionFile) ?? validatedCwd(record.cwd);
     if (spawnCwd === undefined) {
       throw new Error(`cannot resume session "${id}": its recorded working directory no longer exists`);
     }
@@ -283,20 +217,17 @@ export class OmpProvider extends Service implements AgentFactory {
 
     try {
       // Seed the Dash session log by replaying the OMP transcript through the
-      // union persistence (scan → readMessages → replay). There is no
-      // Dash-side log anymore — the replay IS the stored history, so it can
-      // never mismatch a persisted prefix. A missing persistence service
-      // (never in this profile) falls back to replaying via live RPC.
-      const preparation =
-        persistence !== undefined
-          ? await persistence.prepare(id, options.signal)
-          : SessionPreparation.create(loopCtx.sessions.prepare(id, {
-              seed: replayOmpMessages(await rpc.getMessages()),
-              meta: {
-                ...(spawnCwd === undefined ? {} : { cwd: spawnCwd }),
-                createdAt: record.createdAt,
-              },
-            }));
+      // union persistence (scan → readMessages → replay); a persistence-less
+      // composition (never in this profile) falls back to live-RPC replay.
+      const preparation = await (persistence !== undefined
+        ? persistence.prepare(id, options.signal)
+        : SessionPreparation.create(loopCtx.sessions.prepare(id, {
+            seed: replayOmpMessages(await rpc.getMessages()),
+            meta: {
+              ...(spawnCwd === undefined ? {} : { cwd: spawnCwd }),
+              createdAt: record.createdAt,
+            },
+          })));
       trace(`resume id=${id} replayed transcript from OMP store`);
 
       return await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation, rpc, "resume");

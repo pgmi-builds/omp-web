@@ -181,24 +181,37 @@ export function readWebuiPreset(sessionFile: string): string | undefined {
   }
 }
 
+/** The per-session fields the bridge persists beside OMP's transcript. */
+export interface WebuiArtifactFields {
+  /** The Dash session id that owns this OMP session (audit metadata). */
+  readonly dashSessionId?: string;
+  /** The permission preset stamped at createAgent time. */
+  readonly preset?: string;
+}
+
+
 /**
- * Persist the preset atomically (tmp file + rename), best-effort: failures
- * are traced and swallowed — a lost artifact only degrades cold-replay
- * fidelity, never the live session.
+ * Persist the webui artifact atomically (tmp file + rename), best-effort:
+ * failures are traced and swallowed — a lost artifact only degrades
+ * cold-replay fidelity, never the live session. `dashSessionId` is audit
+ * metadata (the only durable Dash↔OMP pairing record); no code reads it.
  */
-export function writeWebuiPreset(sessionFile: string, preset: string): void {
-  if (!isPresetName(preset)) return;
+export function writeWebuiArtifact(sessionFile: string, fields: WebuiArtifactFields): void {
   const artifact = webuiArtifactPath(sessionFile);
   if (!insideStore(artifact)) {
     trace(`write: artifact path escaped the OMP store (${artifact}); skipped`);
     return;
   }
+  const value = {
+    ...(fields.dashSessionId === undefined ? {} : { dashSessionId: fields.dashSessionId }),
+    ...(fields.preset !== undefined && isPresetName(fields.preset) ? { permissionPreset: fields.preset } : {}),
+  };
   try {
     mkdirSync(dirname(artifact), { recursive: true });
     const tmp = `${artifact}.tmp-${randomUUID()}`;
-    writeFileSync(tmp, `${JSON.stringify({ permissionPreset: preset }, undefined, 2)}\n`);
+    writeFileSync(tmp, `${JSON.stringify(value, undefined, 2)}\n`);
     renameSync(tmp, artifact);
-    trace(`write: ${artifact} preset=${preset}`);
+    trace(`write: ${artifact} dashSessionId=${fields.dashSessionId ?? "-"} preset=${fields.preset ?? "-"}`);
   } catch (error) {
     trace(`write: ${artifact} FAILED ${String(error)}`);
   }

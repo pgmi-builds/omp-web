@@ -41,8 +41,9 @@ import {
 } from "@deepseek-ai/dsh-session";
 import { readOmpMessages, scanOmpSessions, type OmpNativeSession } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
-import { isPresetName, permissionEventsFor, readWebuiPreset, statWebuiArtifact, type WebuiStat } from "./permission.js";
 import { dashIdOf, resolveEntryById } from "./pairing.js";
+import { supervisor } from "./supervisor.js";
+import { isPresetName, permissionEventsFor, readWebuiPreset, statWebuiArtifact, type WebuiStat } from "./permission.js";
 
 /** The slice of `ctx.sessionProjectionCache` the boot warm pass reads. */
 interface ProjectionCacheSlice {
@@ -195,6 +196,7 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
 
   async inspect(id: SessionId, signal?: AbortSignal): Promise<SessionInspection> {
     signal?.throwIfAborted();
+    supervisor.noteView(String(id));
     return this.load(id);
   }
 

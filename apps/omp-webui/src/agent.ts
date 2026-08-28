@@ -36,13 +36,14 @@ import type {
   UserMessage,
 } from "@deepseek-ai/dsh-session";
 import type { AssistantMessage, ContentBlock, StreamChunk, TokenUsage } from "@deepseek-ai/dsh-llm";
-import { CallId, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { CallId, QUOTA_EXCEEDED_CODE, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { createScope, type Scope } from "@deepseek-ai/dsh-scope";
 import type { ApprovalOutcome, ApprovalService } from "@deepseek-ai/dsh-user-approval";
 import type { OmpAssistantMessageEvent, OmpContentBlock, OmpMessage, OmpRpcClient, RpcEvent } from "./rpc.js";
 // Type-only: pulls dsh-commands' `Context.commands` augmentation into this
 // compilation (the runtime service is mounted by the base bundle).
 import type {} from "@deepseek-ai/dsh-commands";
+import { supervisor } from "./supervisor.js";
 
 /** Diagnostic trace (set OMP_TRACE=1 on the dsh process to enable). */
 const TRACE = process.env.OMP_TRACE === "1";
@@ -74,6 +75,38 @@ export function convertContent(blocks: OmpContentBlock[] | undefined): ContentBl
     }
   }
   return result;
+}
+
+/**
+ * Classify OMP's `stopReason: "error"` assistant message into a Dash `failure`
+ * (`{ message, code }`). This is the same taxonomy the harness adapters use for
+ * `turn/end` reasons — `AUTH`, `RATE_LIMIT`, `QUOTA`, `SERVER` — so the Web UI
+ * renders it through its own error path (the red "API key is invalid" alert,
+ * turn-positioned failure feedback) instead of an empty assistant bubble.
+ * Quota/usage wording is checked before the generic 403→AUTH because OMP's
+ * providers (e.g. kimi) report an exhausted billing quota as HTTP 403.
+ */
+export function ompFailure(message: OmpMessage): { message: string; code: string } | undefined {
+  if (message.stopReason !== "error") return undefined;
+  const status = typeof message.errorStatus === "number" ? message.errorStatus : undefined;
+  const text =
+    typeof message.errorMessage === "string" && message.errorMessage.trim() !== ""
+      ? message.errorMessage.trim()
+      : undefined;
+  const detail = text ?? "";
+  let code: string;
+  if (/\b(?:usage|rate)\s*limit\b/i.test(detail) || /\bquota\b/i.test(detail) || /\bbilling\b/i.test(detail) || /\binsufficient\b/i.test(detail)) {
+    code = QUOTA_EXCEEDED_CODE;
+  } else if (status === 401 || status === 403) {
+    code = "AUTH";
+  } else if (status === 429) {
+    code = "RATE_LIMIT";
+  } else if (status !== undefined && status >= 500) {
+    code = "SERVER";
+  } else {
+    code = "UNKNOWN";
+  }
+  return { message: text ?? (status !== undefined ? `HTTP ${status}` : "model request failed"), code };
 }
 
 /** Map OMP's usage accounting into Dash `TokenUsage` (disjoint field names). */
@@ -209,6 +242,11 @@ interface AgentDefaultModelSlice {
   currentSelection(): { provider: string; model: string };
 }
 
+/** The slice of `ctx.systemPrompt` the selection snapshot needs: run the assemble waterfall. */
+interface SystemPromptSlice {
+  assemble(context?: { agent?: unknown; scope?: unknown; signal?: AbortSignal }): Promise<unknown>;
+}
+
 export class OmpAgent implements Agent {
   readonly id: SessionId;
   readonly options: AgentOptions;
@@ -228,6 +266,8 @@ export class OmpAgent implements Agent {
   #lastTurn = 0;
   #turnOpen = false;
   #cancelCause: AgentCancelCause | null = null;
+  /** Terminal model failure of the open turn (`message_end` stopReason "error"); consumed by `agent_end`. */
+  #pendingFailure: { message: string; code: string } | null = null;
   #chunkSeqs: number[] = [];
 
   /** The current turn's user/message was appended locally and OMP's echo is still awaited. */
@@ -407,12 +447,14 @@ export class OmpAgent implements Agent {
     }
     this.#deliverPrompt(message);
   }
-
   #deliverPrompt(message: UserMessage): void {
     if (this.#disposed) return;
     trace(`#deliverPrompt turn=${this.#dashTurn + 1} text="${userMessageText(message).slice(0, 40)}"`);
     this.#openTurn(message);
     const text = userMessageText(message);
+    clearTimeout(this.#idleExitTimer);
+    this.#idleExitTimer = undefined;
+    supervisor.reportUserText(String(this.id), text);
     this.#beginActivity();
     void this.#syncModelSelection().finally(() => {
       void this.#rpc.prompt(text).catch((error) => this.#fail(error));
@@ -426,6 +468,9 @@ export class OmpAgent implements Agent {
    */
   #queueRemote(message: UserMessage, transport: "followUp" | "steer"): void {
     if (this.#disposed) return;
+    clearTimeout(this.#idleExitTimer);
+    this.#idleExitTimer = undefined;
+    supervisor.reportUserText(String(this.id), userMessageText(message));
     this.#remoteQueue.push({ message, sent: false, transport });
     if (this.#streaming || transport === "followUp") this.#flushRemote();
   }
@@ -444,25 +489,70 @@ export class OmpAgent implements Agent {
   }
 
   /**
-   * Sync the Dash model selection into OMP before a turn is dispatched. The
-   * apiproxy writes the selection through `ctx.agentDefaultModel.saveSelection`
-   * on `session.selectModel`; reading it here and issuing `set_model` only when
-   * it changed keeps OMP's model in lockstep with the selector while skipping
-   * the redundant round-trips a per-turn sync would otherwise pay.
+   * The selection a turn should run under, resolved exactly as the native
+   * loop resolves it (`buildRequest`): the base is the session's logged
+   * `request/header` (the replay synthesizes it from OMP's transcript, so a
+   * resumed session keeps ITS last model) falling back to the global default;
+   * the `system-prompt/assemble` → `agent/request` waterfall pair then applies
+   * the apiproxy's installed selection, so a switch made in the Web UI this
+   * process still wins. OMP itself already restores the transcript's model on
+   `--resume`, which is why {@link #syncModelSelection} only pushes when the
+   * resolved target differs from OMP's live state.
+   */
+  async #effectiveModelSelection(): Promise<{ provider: string; model: string }> {
+    const base = this.#baseModelSelection();
+    const systemPrompt = this.ctx.get("systemPrompt") as SystemPromptSlice | undefined;
+    if (systemPrompt !== undefined) {
+      try {
+        await systemPrompt.assemble({ agent: this, scope: this });
+      } catch (error) {
+        trace(`model selection assemble failed: ${String(error)}`);
+      }
+    }
+    try {
+      const resolved = await this.#dispatch.waterfall(
+        "agent/request",
+        { turn: this.#dashTurn, step: this.#step, signal: new AbortController().signal },
+        () => Promise.resolve(base),
+      );
+      if (resolved.provider !== "" && resolved.model !== "") {
+        return { provider: resolved.provider, model: resolved.model };
+      }
+    } catch (error) {
+      trace(`model selection waterfall failed: ${String(error)}`);
+    }
+    return base;
+  }
+
+  /** Tier-2/3 base: the session's logged header config, else the global default, else agent options. */
+  #baseModelSelection(): { provider: string; model: string } {
+    const persisted = this.session.requestHeader()?.config;
+    if (persisted !== undefined && persisted.provider !== "" && persisted.model !== "") {
+      return { provider: persisted.provider, model: persisted.model };
+    }
+    const service = this.ctx.get("agentDefaultModel") as AgentDefaultModelSlice | undefined;
+    const selection = service?.currentSelection();
+    if (selection !== undefined && selection.provider !== "" && selection.model !== "") return selection;
+    return { provider: this.options.provider ?? "", model: this.options.model ?? "" };
+  }
+
+  /**
+   * Sync the effective model selection into OMP before a turn is dispatched.
+   * `set_model` fires only when the resolved target differs from OMP's live
+   * model, so a plain resume (OMP already restored the transcript's model, and
+   * the replayed header names the same one) performs no round-trip at all.
    */
   async #syncModelSelection(): Promise<void> {
-    const service = this.ctx.get("agentDefaultModel") as AgentDefaultModelSlice | undefined;
-    if (service === undefined) return;
-    const selection = service.currentSelection();
-    const key = `${selection.provider}/${selection.model}`;
+    const target = await this.#effectiveModelSelection();
+    const key = `${target.provider}/${target.model}`;
     if (key === this.#lastSyncedModel) return;
     const state = await this.#rpc.getState().catch(() => null);
     const ompModel = state?.model;
-    if (ompModel?.provider === selection.provider && ompModel?.id === selection.model) {
+    if (ompModel?.provider === target.provider && ompModel?.id === target.model) {
       this.#lastSyncedModel = key;
       return;
     }
-    await this.#rpc.setModel(selection.provider, selection.model).catch((error) => {
+    await this.#rpc.setModel(target.provider, target.model).catch((error) => {
       trace(`set_model ${key} failed: ${String(error)}`);
     });
     this.#lastSyncedModel = key;
@@ -561,12 +651,41 @@ export class OmpAgent implements Agent {
     clearTimeout(this.#idleExitTimer);
     this.#idleExitTimer = setTimeout(() => {
       this.#idleExitTimer = undefined;
-      if (!this.#disposed && !this.#streaming) {
-        trace(`idle exit after ${OMP_IDLE_EXIT_MS}ms — disposing agent ${this.id}`);
-        this.#onIdleExit?.();
-      }
+      void this.#revalidateIdleExit();
     }, OMP_IDLE_EXIT_MS);
     this.#idleExitTimer.unref?.();
+  }
+
+  /**
+   * Five-fold quiescence re-validation at fire time. The idle timer is only a
+   * hint: before teardown, re-confirm no live work via local signals and OMP's
+   * own self-attestation (get_state streaming/compacting/queued, get_subagents
+   * liveness). Any busy signal re-arms instead of killing; a query failure
+   * fail-softs to the local signals rather than forcing a teardown.
+   */
+  async #revalidateIdleExit(): Promise<void> {
+    if (this.#disposed || this.#streaming) return this.#armIdleExit();
+    if (this.#remoteQueue.some((entry) => !entry.sent)) return this.#armIdleExit();
+    if (this.#approvalAborts.size > 0) return this.#armIdleExit();
+    try {
+      const state = await this.#rpc.getState();
+      if (this.#streaming) return this.#armIdleExit();
+      if (state.isStreaming) return this.#armIdleExit();
+      if (state.isCompacting === true) return this.#armIdleExit();
+      if (typeof state.queuedMessageCount === "number" && state.queuedMessageCount > 0) return this.#armIdleExit();
+    } catch {
+      // Self-attestation unavailable: local signals remain authoritative.
+    }
+    try {
+      const subagents = await this.#rpc.getSubagents();
+      if (this.#streaming) return this.#armIdleExit();
+      if (subagents.length > 0) return this.#armIdleExit();
+    } catch {
+      // getSubagents fail-softs already; belt-and-suspenders.
+    }
+    if (this.#streaming) return this.#armIdleExit();
+    trace(`idle exit after ${OMP_IDLE_EXIT_MS}ms — disposing agent ${this.id}`);
+    this.#onIdleExit?.();
   }
 
   #fail(error: unknown): void {
@@ -589,6 +708,7 @@ export class OmpAgent implements Agent {
         // first message arrives (a queued follow-up opens a fresh turn).
         trace("event turn_start");
         this.#stepStartPending = true;
+        this.#pendingFailure = null;
         break;
 
       case "message_start": {
@@ -621,7 +741,13 @@ export class OmpAgent implements Agent {
         if (message === undefined) break;
         const role = message.role as string;
         if (role === "assistant") {
-          this.#appendAssistantMessage(message);
+          const failure = ompFailure(message);
+          if (failure !== undefined) {
+            this.#pendingFailure = failure;
+            this.#chunkSeqs = [];
+          } else {
+            this.#appendAssistantMessage(message);
+          }
         } else if (role === "toolResult") {
           this.#appendToolResultMessage(message);
         } else if (role !== "user") {
@@ -660,9 +786,17 @@ export class OmpAgent implements Agent {
         }
         break;
 
-      case "agent_end":
+      case "agent_end": {
         trace(`event agent_end cancelCause=${String(this.#cancelCause)}`);
-        this.#closeTurn(this.#cancelCause !== null ? { kind: "aborted", reason: this.#cancelCause } : { kind: "completed" });
+        const pendingFailure = this.#pendingFailure;
+        this.#pendingFailure = null;
+        this.#closeTurn(
+          this.#cancelCause !== null
+            ? { kind: "aborted", reason: this.#cancelCause }
+            : pendingFailure !== null
+              ? { kind: "error", error: pendingFailure }
+              : { kind: "completed" },
+        );
         this.#cancelCause = null;
         this.#markIdle();
         this.#endActivity();
@@ -677,6 +811,7 @@ export class OmpAgent implements Agent {
           .catch(() => {});
 
         break;
+      }
     }
   }
 

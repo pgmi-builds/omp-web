@@ -16,7 +16,7 @@
 import { CallId, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import type { SessionEvent, TurnEndReason } from "@deepseek-ai/dsh-session";
 import type { OmpMessage } from "./rpc.js";
-import { convertContent, convertUsage } from "./agent.js";
+import { convertContent, convertUsage, ompFailure } from "./agent.js";
 
 /** The OMP tool-call block shape inside an assistant message's content. */
 interface OmpToolCallBlock {
@@ -33,6 +33,7 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
   let step = 0;
   let turnOpen = false;
   let stepOpen = false;
+  let turnFailure: { message: string; code: string } | null = null;
   let time = Date.now();
 
   const push = (
@@ -48,12 +49,14 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
     stepOpen = false;
     push("step/end", { turn, step });
   };
-
   const closeTurn = (): void => {
     closeStep();
     if (!turnOpen) return;
     turnOpen = false;
-    push("turn/end", { turn, reason: { kind: "completed" } as TurnEndReason });
+    const reason: TurnEndReason =
+      turnFailure !== null ? { kind: "error", error: turnFailure } : { kind: "completed" };
+    push("turn/end", { turn, reason });
+    turnFailure = null;
   };
 
   for (const message of messages) {
@@ -77,6 +80,11 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
           turnOpen = true;
           push("turn/start", { turn });
         }
+        const failure = ompFailure(message);
+        if (failure !== undefined) {
+          turnFailure = failure;
+          break;
+        }
         step += 1;
         stepOpen = true;
         push("step/start", { turn, step });
@@ -87,8 +95,9 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
           const args = typeof block.arguments === "string" ? block.arguments : JSON.stringify(block.arguments ?? {});
           push("tool/call", { turn, step, callId, name, arguments: args });
         }
+        const content = convertContent(message.content);
         const assistant = createAssistantMessage({
-          content: convertContent(message.content),
+          content,
           source: {
             provider: String(message.provider ?? ""),
             model: String(message.model ?? ""),
@@ -130,15 +139,46 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
 }
 
 /**
+ * The session's last model call, from the last assistant message that names a
+ * provider/model pair. OMP restores exactly this model on `--resume`; the
+ * replayed Dash log records it as a `request/header` event so the model
+ * selector resolves the session's OWN model (upstream's tier-2 selection)
+ * instead of falling through to the global default.
+ */
+function lastModelCall(messages: OmpMessage[]): { provider: string; model: string } | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "assistant") continue;
+    const provider = typeof message.provider === "string" ? message.provider : "";
+    const model = typeof message.model === "string" ? message.model : "";
+    if (provider !== "" && model !== "") return { provider, model };
+  }
+  return undefined;
+}
+
+/**
  * Compose the full cold Dash event log for one OMP transcript: an optional
  * leading `session/title` event (so the sidebar title projection folds
  * immediately, pinned `user`-sourced so Dash's own generator never fights
- * OMP's title authority) followed by the message replay, with contiguous
- * `seq` renumbered from 0.
+ * OMP's title authority), a `request/header` event carrying the transcript's
+ * last model (see {@link lastModelCall}), followed by the message replay,
+ * with contiguous `seq` renumbered from 0.
  */
 export function replayOmpTranscript(messages: OmpMessage[], title?: string, titleTime?: number): SessionEvent[] {
   const replayed = replayOmpMessages(messages);
-  if (title === undefined || title.length === 0) return replayed;
+  const config = lastModelCall(messages);
+  if (title === undefined || title.length === 0) {
+    if (config === undefined) return replayed;
+    return [
+      {
+        type: "request/header",
+        seq: 0,
+        time: replayed[0]?.time ?? Date.now(),
+        data: { header: { config } },
+      } as unknown as SessionEvent,
+      ...replayed,
+    ].map((event, index) => ({ ...event, seq: index }));
+  }
   const events: SessionEvent[] = [
     {
       type: "session/title",
@@ -146,6 +186,16 @@ export function replayOmpTranscript(messages: OmpMessage[], title?: string, titl
       time: titleTime ?? replayed[0]?.time ?? Date.now(),
       data: { title, messageSeqs: [], source: { kind: "user" } },
     } as unknown as SessionEvent,
+    ...(config === undefined
+      ? []
+      : [
+          {
+            type: "request/header",
+            seq: 0,
+            time: titleTime ?? replayed[0]?.time ?? Date.now(),
+            data: { header: { config } },
+          } as unknown as SessionEvent,
+        ]),
     ...replayed,
   ];
   return events.map((event, index) => ({ ...event, seq: index }));

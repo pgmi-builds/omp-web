@@ -271,6 +271,18 @@ export class OmpRpcClient {
     if (!response.success) throw new Error(`omp get_session_stats failed: ${String(response.error ?? "unknown error")}`);
     return (response.data ?? {}) as OmpSessionStats;
   }
+  /** Query `get_subagents`; live subagent registry (fail-soft: [] when unavailable). */
+  async getSubagents(): Promise<unknown[]> {
+    try {
+      const response = await this.send({ type: "get_subagents" });
+      if (!response.success) return [];
+      const data = response.data as { subagents?: unknown[] } | undefined;
+      return data?.subagents ?? [];
+    } catch {
+      return [];
+    }
+  }
+
   /**
    * Start a turn with a user prompt. On an idle session `prompt` wakes the
    * agent and starts a fresh turn. Never send this while OMP is streaming:
@@ -317,6 +329,9 @@ export class OmpRpcClient {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    if (process.env.OMP_TRACE === "1") {
+      process.stderr.write(`[omp-rpc ${Date.now() % 1_000_000}] close() stack=${new Error().stack?.split("\n").slice(1, 6).join(" <- ")}\n`);
+    }
     this.#kill();
     this.#fail(new Error("omp rpc client closed"));
   }

@@ -33,3 +33,7 @@ Thumbs.db
 # --- local agent tooling (keep on disk, never commit) ---
 .agents/
 .pi/
+.dsh-test/
+
+# --- phase 3: omp-in-dsh coexistence plugin (future work, not in provider v0.1.0) ---
+apps/omp-in-dsh/

@@ -30,7 +30,7 @@ import type {
   ResumeAgentOptions,
 } from "@deepseek-ai/dsh-agent";
 import { emitAgentEvent } from "@deepseek-ai/dsh-agent";
-import { SessionPreparation, type SessionEvent, type SessionId } from "@deepseek-ai/dsh-session";
+import { SessionPreparation, type Session, type SessionEvent, type SessionId } from "@deepseek-ai/dsh-session";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
 import { OmpRpcClient } from "./rpc.js";
 import { OmpAgent } from "./agent.js";
@@ -38,10 +38,15 @@ import { replayOmpMessages } from "./replay.js";
 import { OmpLlmAdapter } from "./adapter.js";
 import { OmpUnionSessionPersistence } from "./session-persistence-omp.js";
 import { SingleOmpPresetRoster } from "./agent-preset-omp.js";
-import { resolveEntryById } from "./pairing.js";
-import { cwdFromSessionFile, OMP_SESSIONS_ROOT } from "./omp-store.js";
+import { dashIdOf, resolveEntryById } from "./pairing.js";
+import { cwdFromSessionFile, foreignWriterPid, OMP_SESSIONS_ROOT, scanOmpSessions } from "./omp-store.js";
+import { supervisor } from "./supervisor.js";
+import { STORAGE_RECONCILE_INTERVAL_MS } from "./knobs.js";
 import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents, readWebuiPreset, writeWebuiArtifact } from "./permission.js";
 import { ompProviderIds } from "./models.js";
+
+/** Bounded grace for avoidance hand-off: abort then wait this long before forced teardown. */
+const AVOIDANCE_GRACE_MS = 10_000;
 
 /** Realpath of a recorded cwd, accepted only when it names an existing directory. */
 function validatedCwd(cwd: string | undefined): string | undefined {
@@ -71,11 +76,28 @@ interface SessionPersistenceSlice {
   prepare(id: SessionId, signal?: AbortSignal): Promise<SessionPreparation>;
 }
 
+/** The slice of `ctx.workspaceRegistry` the boot workspace-reconcile reads. */
+interface WorkspaceEntitySlice {
+  readonly id: string;
+  readonly path: string;
+  readonly sessionIds: readonly string[];
+  attachSession(sessionId: string): Promise<void>;
+}
+interface WorkspaceRegistrySlice {
+  resolveByPath(path: string): Promise<WorkspaceEntitySlice | undefined>;
+  create(path: string, title?: string): Promise<WorkspaceEntitySlice>;
+  list(): WorkspaceEntitySlice[];
+}
+
 export class OmpProvider extends Service implements AgentFactory {
   static inject: string[] = ["agents", "sessions", "llm"];
 
   /** Plain holder — prevents Cordis re-tracing the factory's ctx through a caller shadow. */
   private readonly runtime: { ctx: Context };
+  /** Stops the supervisor's follow loop on provider teardown. */
+  private stopFollow: () => void = () => {};
+  /** Live RPC-backed agents by dash id, for avoidance hand-off. */
+  private readonly heldAgents = new Map<string, AgentHandle>();
 
   constructor(ctx: Context) {
     super(ctx, "ompProvider");
@@ -89,6 +111,85 @@ export class OmpProvider extends Service implements AgentFactory {
     // they load with this plugin — before any dependent service initializes.
     ctx.plugin(OmpUnionSessionPersistence);
     ctx.plugin(SingleOmpPresetRoster);
+    // Session supervisor: state machine + cold projection + foreign detection.
+    // `ctx.logger` output is not captured by the systemd journal in this
+    // profile; supervisor events are load-bearing (avoidance), so mirror them
+    // to stderr — the only channel guaranteed to reach the operator log.
+    supervisor.attach(this.runtime.ctx.sessions, (msg) => {
+      const line = `[omp-supervisor] ${msg}`;
+      this.runtime.ctx.logger.info(line);
+      process.stderr.write(`${line}\n`);
+    });
+    supervisor.reconcile();
+    this.stopFollow = supervisor.startFollow();
+    supervisor.onAvoidance((id) => void this.handleAvoidance(id));
+    ctx.effect(() => () => this.stopFollow(), "ompProvider.followStop()");
+    this.#reconcileWorkspaces();
+  }
+
+  /**
+   * Reconcile the Web UI workspace sidebar against the scanned OMP store.
+   *
+   * The upstream workspace registry (`dsh-workspace`) only auto-groups by cwd
+   * on its FIRST boot (`bootstrap`); every session appearing later is grouped
+   * solely by `workspace.attachSession`, which the apiproxy calls only during
+   * `create`. TUI-born OMP sessions never pass through `create`, so without
+   * this pass they land in the "Ungrouped" bucket even though their cwd is
+   * durable in the transcript. Attach each scanned session by its DASH-facing
+   * id (dev_0.0.3 §11: OMP ids never cross the bridge boundary) to the
+   * workspace owning its canonical cwd — idempotent, fail-soft, every boot.
+   */
+  #reconcileWorkspaces(): void {
+    this.runtime.ctx.inject(["workspaceRegistry"], (wctx) => {
+      const registry = wctx.get("workspaceRegistry") as WorkspaceRegistrySlice | undefined;
+      if (registry === undefined) return;
+      const run = (): void => {
+        void this.#attachScannedSessions(registry);
+        supervisor.reconcile();
+      };
+      run();
+      // The registry groups by cwd only at ITS boot, so TUI-side sessions
+      // created later (the store gains files at any time) would sit in
+      // "Ungrouped" forever. Re-attach periodically: idempotent, fail-soft,
+      // and the scan is a stat pass over the store.
+      const timer = setInterval(run, STORAGE_RECONCILE_INTERVAL_MS);
+      timer.unref();
+      wctx.effect(() => () => clearInterval(timer), "ompProvider.reconcileTimer()");
+    });
+  }
+
+  /** One idempotent attach pass: every scanned session joins the workspace owning its canonical cwd. */
+  async #attachScannedSessions(registry: WorkspaceRegistrySlice): Promise<void> {
+    try {
+      const excluded = new Set<string>();
+      for (const home of [
+        process.env.OMP_HOME ?? join(homedir(), ".omp"),
+        process.env.DSH_HOME ?? join(homedir(), ".omp", "dsh"),
+      ]) {
+        try {
+          excluded.add(realpathSync(home));
+        } catch {
+          // Unresolvable home: nothing to exclude.
+        }
+      }
+      const groups = new Map<string, string[]>();
+      for (const entry of scanOmpSessions().values()) {
+        const cwd = validatedCwd(entry.cwd);
+        if (cwd === undefined || excluded.has(cwd)) continue;
+        const id = dashIdOf(entry);
+        const ids = groups.get(cwd);
+        if (ids === undefined) groups.set(cwd, [id]);
+        else if (!ids.includes(id)) ids.push(id);
+      }
+      for (const [path, ids] of groups) {
+        const workspace = (await registry.resolveByPath(path)) ?? (await registry.create(path));
+        for (const id of ids) {
+          if (!workspace.sessionIds.includes(id)) await workspace.attachSession(id);
+        }
+      }
+    } catch (error) {
+      this.runtime.ctx.logger.warn(`omp-provider: workspace reconciliation failed: ${String(error)}`);
+    }
   }
 
   /**
@@ -113,6 +214,19 @@ export class OmpProvider extends Service implements AgentFactory {
     const id = options.sessionId;
     const meta = options.meta ?? {};
     const cwd = meta.cwd;
+
+    // Fork (the apiproxy's `session.fork`) seeds a copied-turn prefix but OMP
+    // has no native fork: the child spawned below would start with an EMPTY
+    // context while the UI renders the copied history, and after a restart
+    // even that history would vanish (OMP's transcript holds only post-fork
+    // traffic). Fail the fork cleanly at the factory boundary instead of
+    // splitting the two surfaces. `parentSession` in create metadata is set
+    // only by the fork path (subagents go through ctx.subagents instead).
+    if (meta.parentSession !== undefined) {
+      throw new Error(
+        `cannot fork session "${meta.parentSession}" onto the OMP provider: OMP has no native session fork`,
+      );
+    }
 
     // Approval policy is pinned at OMP launch and the Dash session does not
     // exist yet at this point (it is prepared + announced — which is what
@@ -146,9 +260,9 @@ export class OmpProvider extends Service implements AgentFactory {
         ...(meta === undefined ? {} : { meta }),
       }));
 
-      const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation, rpc, "startup");
+      const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation.session, rpc, "startup", { enterSession: true, preparation });
 
-      return handle;
+      return this.registerHeld(id, state.sessionFile ?? "", handle);
     } catch (error) {
       rpc.close();
       throw error;
@@ -158,6 +272,11 @@ export class OmpProvider extends Service implements AgentFactory {
   async resume(ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle> {
     const loopCtx = this.runtime.ctx;
     const id = options.resumeSessionId;
+    // L1: a session mid-avoidance must not receive prompts (the RPC is being
+    // handed off to the TUI; feeding it a prompt races the teardown).
+    if (supervisor.isAvoiding(id)) {
+      throw new Error(`cannot resume session "${id}": hand-off to the TUI is in progress`);
+    }
 
     // Identity (dev_0.0.3 §11): translate the Dash-facing id (real Dash id
     // via the webui.json pairing, or a stateless derived id) back to its
@@ -211,14 +330,55 @@ export class OmpProvider extends Service implements AgentFactory {
     const approvalMode = envMode ?? ompApprovalMode(preset);
     trace(`resume id=${id} preset=${preset ?? "none"} approval-mode=${approvalMode}${envMode === undefined ? "" : " (env override)"}`);
 
+    // Exclusive hold, L2 (pre-spawn). OMP has no session-level or file-level
+    // locking (a TUI `omp` and a bridge `--mode rpc --resume` otherwise
+    // interleave appends on one transcript). omp 18's writer opens the file
+    // per write and closes it, so a /proc fd scan cannot see an idle TUI;
+    // the fd check is kept as a free strong signal, and a hot mtime (<2s)
+    // catches a TUI mid-generation. An idle TUI is undetectable here by
+    // design — the held-state content watch (≤ FILE_FOLLOW_INTERVAL_MS)
+    // detects its first prompt and avoids.
+    const holder = foreignWriterPid(sessionFile);
+    if (holder !== undefined) {
+      throw new Error(
+        `cannot resume session "${id}": its transcript is already open in another OMP process (pid ${holder}) — close it there first`,
+      );
+    }
+    let mtimeMs = 0;
+    try {
+      mtimeMs = statSync(sessionFile).mtimeMs;
+    } catch {
+      // Unreadable now — the spawn below will surface the real error.
+    }
+    const hotMs = mtimeMs === 0 ? Number.POSITIVE_INFINITY : Date.now() - mtimeMs;
+    if (hotMs < 2_000) {
+      throw new Error(
+        `cannot resume session "${id}": its transcript changed ${Math.round(hotMs)}ms ago — another OMP process may be writing it; retry in a moment`,
+      );
+    }
+
     // Re-attach to the OMP session by its persisted file (OMP owns the live
     // agent transcript and keeps generating it from here on).
     const rpc = await OmpRpcClient.spawn(["--approval-mode", approvalMode, "--resume", sessionFile], spawnCwd);
 
+    // L3: TOCTOU closer — a TUI may have opened the file in the spawn window.
+    const postHolder = foreignWriterPid(sessionFile);
+    if (postHolder !== undefined) {
+      rpc.close();
+      throw new Error(`cannot resume session "${id}": a TUI process (pid ${postHolder}) opened it during spawn`);
+    }
+
     try {
-      // Seed the Dash session log by replaying the OMP transcript through the
-      // union persistence (scan → readMessages → replay); a persistence-less
-      // composition (never in this profile) falls back to live-RPC replay.
+      // Promotion: reuse the live shadow projection (no re-enter, seq continuous).
+      const shadowSession = supervisor.shadowSessionOf(id);
+      if (shadowSession !== undefined) {
+        trace(`resume id=${id} promoting shadow session`);
+        const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, shadowSession, rpc, "resume", { enterSession: false });
+        return this.registerHeld(id, sessionFile, handle);
+      }
+
+      // Fresh attach: seed the Dash session log by replaying the OMP transcript
+      // through the union persistence (scan → readMessages → replay).
       const preparation = await (persistence !== undefined
         ? persistence.prepare(id, options.signal)
         : SessionPreparation.create(loopCtx.sessions.prepare(id, {
@@ -230,12 +390,49 @@ export class OmpProvider extends Service implements AgentFactory {
           })));
       trace(`resume id=${id} replayed transcript from OMP store`);
 
-      return await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation, rpc, "resume");
+      const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation.session, rpc, "resume", { enterSession: true, preparation });
+      return this.registerHeld(id, sessionFile, handle);
     } catch (error) {
+      trace(`resume ${id} THREW: ${String(error)} | stack=${error instanceof Error ? error.stack?.slice(0, 400) : "n/a"}`);
       rpc.close();
       throw error;
     }
   }
+  /**
+   * Track a published RPC-backed agent and hand the session to the supervisor
+   * as held. Arrow FIELD (not a `#` method): the provider is exposed through
+   * a Cordis tracing proxy, and hard-private methods fail their brand check
+   * on the proxy receiver (the same reason setupAndPublish is module-level).
+   */
+  private readonly registerHeld = (id: SessionId, file: string, handle: AgentHandle): AgentHandle => {
+    const wrapped: AgentHandle = {
+      agent: handle.agent,
+      dispose: async () => {
+        this.heldAgents.delete(String(id));
+        await handle.dispose();
+      },
+    };
+    this.heldAgents.set(String(id), wrapped);
+    if (file !== "") supervisor.onHeld(String(id), file);
+    return wrapped;
+  };
+
+  /** Avoidance hand-off (arrow field: proxy-safe). Abort the in-flight turn, bounded grace, teardown. */
+  private readonly handleAvoidance = async (id: string): Promise<void> => {
+    const handle = this.heldAgents.get(id);
+    if (handle === undefined) return;
+    const line = `[omp-supervisor] avoiding session ${id} — abort + bounded grace + teardown`;
+    this.runtime.ctx.logger.warn(line);
+    process.stderr.write(`${line}\n`);
+    const agent = handle.agent;
+    agent.cancel({ kind: "hook", reason: "tui-takeover" }, {});
+    await Promise.race([
+      agent.whenIdle(),
+      new Promise<void>((resolve) => setTimeout(resolve, AVOIDANCE_GRACE_MS)),
+    ]);
+    await handle.dispose();
+  };
+
 
 }
 
@@ -251,9 +448,10 @@ async function setupAndPublish(
   id: SessionId,
   agentOptions: AgentOptions,
   setup: AgentSetup | undefined,
-  preparation: SessionPreparation,
+  session: Session,
   rpc: OmpRpcClient,
   source: "startup" | "resume",
+  opts: { enterSession: boolean; preparation?: SessionPreparation },
 ): Promise<AgentHandle> {
   let detachSession: (() => void) | undefined;
   let detachAgent: (() => void) | undefined;
@@ -262,8 +460,10 @@ async function setupAndPublish(
   // expires (see OmpAgent's idle exit) — defined only after publication.
   let idleExit: (() => void) | undefined;
   try {
-    // Build the agent shim over the prepared session and the live RPC client.
-    agent = new OmpAgent(loopCtx, id, agentOptions, preparation.session, rpc, () => idleExit?.());
+    // Build the agent shim over the session and the live RPC client. For a
+    // promoted shadow the session is already entered+announced; enterSession
+    // is false and the projection is reused (seq-continuous promotion).
+    agent = new OmpAgent(loopCtx, id, agentOptions, session, rpc, () => idleExit?.());
 
     // Composition-only setup on the unpublished agent scope.
     const commit = await setup?.(agent.ctx);
@@ -272,9 +472,11 @@ async function setupAndPublish(
     // session-start. The commit runs immediately before publication.
     commit?.commit();
 
-    detachSession = agent.ctx.sessions.enter(preparation.session);
+    if (opts.enterSession) {
+      detachSession = agent.ctx.sessions.enter(session);
+      agent.ctx.sessions.announce(session);
+    }
     detachAgent = loopCtx.agents.enter(agent, ownerCtx.agent);
-    agent.ctx.sessions.announce(preparation.session);
     loopCtx.agents.announce(agent);
     emitAgentEvent(loopCtx, agent, "agent/session-start", { source });
 
@@ -283,10 +485,12 @@ async function setupAndPublish(
     const dispose = async (): Promise<void> => {
       if (disposed) return;
       disposed = true;
+      trace(`dispose() called for agent ${id} (source=${source}) stack=${new Error().stack?.split("\n").slice(1, 4).join(" <- ")}`);
       unfollowOwner?.();
       await agent?.dispose();
       detachAgent?.();
       detachSession?.();
+      supervisor.onHeldDisposed(String(id));
     };
     idleExit = () => void dispose();
 
@@ -300,6 +504,7 @@ async function setupAndPublish(
     // Unwind the half-published transaction. A failure between `enter` and
     // the announcements (e.g. a persistence listener rejecting the session)
     // must not leave a live-but-dead entry the API resolver would serve.
+    trace(`setupAndPublish ${id} FAILED: ${String(error)}`);
     detachAgent?.();
     detachSession?.();
     void agent?.dispose().catch(() => {});
@@ -309,8 +514,9 @@ async function setupAndPublish(
     // Release the preparation's per-id reservation on every path (mirrors
     // the reference loop's unconditional dispose): the session it seeded is
     // already published above, so a same-process re-resume of this id can
-    // prepare again instead of colliding with a leaked reservation.
-    preparation[Symbol.dispose]();
+    // prepare again instead of colliding with a leaked reservation. Promotion
+    // has no preparation (the shadow's projection persists across the call).
+    opts.preparation?.[Symbol.dispose]();
   }
 }
 

@@ -8,7 +8,7 @@
  * transcript). Parsed entries are memoized per file keyed on (size, mtime),
  * so repeated `list()` calls re-stat but re-parse only changed files.
  */
-import { closeSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { OmpMessage } from "./rpc.js";
@@ -278,4 +278,109 @@ export function scanOmpSessions(): Map<string, OmpNativeSession> {
     }
   }
   return sessions;
+}
+
+/** Parent pid of a process, from `/proc/<pid>/stat` (undefined when unreadable). */
+function parentPid(pid: number): number | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // The comm field may contain spaces and parens; fields resume after the LAST ')'.
+    const tail = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const ppid = Number.parseInt(tail[1] ?? "", 10);
+    return Number.isNaN(ppid) ? undefined : ppid;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether `pid` sits anywhere below `ancestor` in the process tree. */
+function isDescendantOf(pid: number, ancestor: number): boolean {
+  let current = pid;
+  for (let hop = 0; hop < 32; hop += 1) {
+    if (current === ancestor) return true;
+    const parent = parentPid(current);
+    if (parent === undefined || parent <= 1) return false;
+    current = parent;
+  }
+  return false;
+}
+
+/**
+ * One /proc pass over every foreign process's write-mode file descriptors,
+ * returning `canonical path → first foreign writer pid`. Shared by every
+ * session in one tick so the daemon never re-scans /proc per file.
+ *
+ * OMP has no session-level exclusivity: neither the TUI nor `--mode rpc`
+ * locks its transcript, so two live writers interleave appends silently
+ * (verified: a TUI `omp` and a bridge `omp --mode rpc --resume` coexisted on
+ * one file with plain `w` descriptors and no advisory locks). The bridge
+ * therefore refuses to resume a transcript another process already writes —
+ * the TUI case — closing the split-brain at the only layer that can see it.
+ * Own descendants (a just-torn-down bridge child whose fds linger) are
+ * exempt to keep teardown races from wedging re-resume.
+ */
+export function scanForeignWriters(): Map<string, number> {
+  const holders = new Map<string, number>();
+  let procEntries: string[];
+  try {
+    procEntries = readdirSync("/proc");
+  } catch {
+    return holders;
+  }
+  const self = process.pid;
+  for (const entry of procEntries) {
+    if (!/^[0-9]+$/.test(entry)) continue;
+    const pid = Number.parseInt(entry, 10);
+    if (pid === self || isDescendantOf(pid, self)) continue;
+    let fds: string[];
+    try {
+      fds = readdirSync(`/proc/${entry}/fd`);
+    } catch {
+      continue;
+    }
+    for (const fd of fds) {
+      let target: string | undefined;
+      try {
+        target = readlinkSync(`/proc/${entry}/fd/${fd}`);
+      } catch {
+        continue;
+      }
+      // Non-path targets (socket:[…], pipe:[…], anon_inode:[…]) can never be a session file.
+      if (!target.startsWith("/")) continue;
+      let flags: number | undefined;
+      try {
+        const info = readFileSync(`/proc/${entry}/fdinfo/${fd}`, "utf8");
+        const flagLine = info.split("\n").find((line) => line.startsWith("flags:"));
+        const raw = flagLine?.split(":")[1]?.trim();
+        flags = raw === undefined ? undefined : Number.parseInt(raw, 8);
+      } catch {
+        continue;
+      }
+      if (flags === undefined || Number.isNaN(flags)) continue;
+      if ((flags & 0b11) === 0) continue; // neither O_WRONLY nor O_RDWR
+      let canonical: string;
+      try {
+        canonical = realpathSync(target);
+      } catch {
+        continue;
+      }
+      if (!holders.has(canonical)) holders.set(canonical, pid);
+    }
+  }
+  return holders;
+}
+
+/**
+ * Pid of a FOREIGN process holding `file` open for writing, if any.
+ * Convenience wrapper over {@link scanForeignWriters} for the single-file
+ * resume gate; the supervisor uses the shared collector directly per tick.
+ */
+export function foreignWriterPid(file: string): number | undefined {
+  let canonical: string;
+  try {
+    canonical = realpathSync(file);
+  } catch {
+    return undefined;
+  }
+  return scanForeignWriters().get(canonical);
 }

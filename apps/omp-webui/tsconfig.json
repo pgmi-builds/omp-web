@@ -12,45 +12,17 @@
     "moduleResolution": "NodeNext",
     "baseUrl": ".",
     "paths": {
-      "@deepseek-ai/cordis": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/cordis/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-agent": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-agent/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-llm": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-llm/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-scope": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-scope/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-session": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-session/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-session/types": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-session/lib/types/types.d.ts"
-      ],
-      "@deepseek-ai/dsh-commands": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-commands/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-user-approval": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-user-approval/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-session-persistence": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-session-persistence/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-session-persistence-jsonl": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-workspace": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-workspace/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-agent-presets": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-agent-presets/lib/types/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-typert-protocol": [
-        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-typert-protocol/lib/types/index.d.ts"
-      ]
+      "@deepseek-ai/cordis": ["./types/@deepseek-ai/cordis/index.d.ts"],
+      "@deepseek-ai/dsh-agent": ["./types/@deepseek-ai/dsh-agent/index.d.ts"],
+      "@deepseek-ai/dsh-agent-presets": ["./types/@deepseek-ai/dsh-agent-presets/index.d.ts"],
+      "@deepseek-ai/dsh-commands": ["./types/@deepseek-ai/dsh-commands/index.d.ts"],
+      "@deepseek-ai/dsh-llm": ["./types/@deepseek-ai/dsh-llm/index.d.ts"],
+      "@deepseek-ai/dsh-scope": ["./types/@deepseek-ai/dsh-scope/index.d.ts"],
+      "@deepseek-ai/dsh-session": ["./types/@deepseek-ai/dsh-session/index.d.ts"],
+      "@deepseek-ai/dsh-session/types": ["./types/@deepseek-ai/dsh-session/types.d.ts"],
+      "@deepseek-ai/dsh-session-persistence": ["./types/@deepseek-ai/dsh-session-persistence/index.d.ts"],
+      "@deepseek-ai/dsh-typert-protocol": ["./types/@deepseek-ai/dsh-typert-protocol/index.d.ts"],
+      "@deepseek-ai/dsh-user-approval": ["./types/@deepseek-ai/dsh-user-approval/index.d.ts"]
     },
     "outDir": "dist",
     "rootDir": "src",

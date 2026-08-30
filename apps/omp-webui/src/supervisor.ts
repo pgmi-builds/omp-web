@@ -15,9 +15,9 @@
 import { statSync } from "node:fs";
 import { SessionPreparation, type Session, type SessionEvent } from "@deepseek-ai/dsh-session";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
-import { readOmpMessages, scanForeignWriters, scanOmpSessions } from "./omp-store.js";
+import { readOmpMessages, scanForeignWriters } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
-import { dashIdOf } from "./pairing.js";
+import { getBridgeStore } from "./store/index.js";
 import { FILE_FOLLOW_INTERVAL_MS, SHADOW_TTL_MS, TRANSITION_FOLLOW_INTERVAL_MS } from "./knobs.js";
 
 export type SupervisorRole = "cold" | "shadow" | "held" | "avoiding";
@@ -96,17 +96,19 @@ export class Supervisor {
   }
   /** Sync entries against the store; drop gone files; refresh role-agnostic state. */
   reconcile(): void {
+    const store = getBridgeStore();
+    if (store === undefined) return;
     const seen = new Set<string>();
-    for (const native of scanOmpSessions().values()) {
-      const id = dashIdOf(native);
+    for (const row of store.list()) {
+      const id = row.dsh_session_id;
       seen.add(id);
       const entry = this.entries.get(id);
       if (entry === undefined) {
-        this.entries.set(id, { role: "cold", file: native.ompSessionFile, title: native.title, createdAt: native.createdAt, lastViewedAt: 0, lastFollowAt: 0, externalNoted: false, pendingNote: false, knownUserTexts: new Set() });
+        this.entries.set(id, { role: "cold", file: row.session_file, title: row.title ?? undefined, createdAt: row.created_at, lastViewedAt: 0, lastFollowAt: 0, externalNoted: false, pendingNote: false, knownUserTexts: new Set() });
       } else {
-        entry.file = native.ompSessionFile;
-        entry.title = native.title;
-        entry.createdAt = native.createdAt;
+        entry.file = row.session_file;
+        entry.title = row.title ?? undefined;
+        entry.createdAt = row.created_at;
       }
     }
     for (const [id, entry] of this.entries) {
@@ -167,6 +169,11 @@ export class Supervisor {
     }
     if (entry.role === "shadow" && this.sessions !== undefined && entry.shadow === undefined) {
       void this.#materialize(id, entry);
+    }
+    // Event-driven teardown stat: reflect the file's final size/mtime now
+    // (the periodic reconcile would pick it up on its next cycle anyway).
+    if (entry.file !== "") {
+      getBridgeStore()?.updateStat(id, statSize(entry.file), statMtime(entry.file));
     }
   }
 
@@ -321,13 +328,13 @@ export class Supervisor {
 
   async #materialize(id: string, entry: Entry): Promise<void> {
     if (entry.shadow !== undefined || this.sessions === undefined) return;
-    const native = [...scanOmpSessions().values()].find((n) => n.ompSessionFile === entry.file);
-    const seed = replayOmpTranscript(readOmpMessages(entry.file), entry.title ?? native?.title, entry.createdAt ?? native?.createdAt);
+    const row = getBridgeStore()?.byFile(entry.file);
+    const seed = replayOmpTranscript(readOmpMessages(entry.file), entry.title ?? row?.title ?? undefined, entry.createdAt ?? row?.created_at);
     try {
       const preparation = await SessionPreparation.create(
         this.sessions.prepare(id, {
           seed,
-          meta: { ...(native?.createdAt === undefined ? {} : { createdAt: native.createdAt }), ...(native?.cwd === undefined ? {} : { cwd: native.cwd }) },
+          meta: { ...(row === undefined ? {} : { createdAt: row.created_at }), ...(row === undefined || row.cwd === null ? {} : { cwd: row.cwd }) },
         }),
       );
       const detach = this.sessions.enter(preparation.session);

@@ -47,6 +47,9 @@
       ],
       "@deepseek-ai/dsh-agent-presets": [
         "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-agent-presets/lib/types/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-typert-protocol": [
+        "/home/u1/.dsh/profiles/node_modules/@deepseek-ai/dsh-typert-protocol/lib/types/index.d.ts"
       ]
     },
     "outDir": "dist",

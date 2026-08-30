@@ -38,12 +38,14 @@ import { replayOmpMessages } from "./replay.js";
 import { OmpLlmAdapter } from "./adapter.js";
 import { OmpUnionSessionPersistence } from "./session-persistence-omp.js";
 import { SingleOmpPresetRoster } from "./agent-preset-omp.js";
-import { dashIdOf, resolveEntryById } from "./pairing.js";
-import { cwdFromSessionFile, foreignWriterPid, OMP_SESSIONS_ROOT, scanOmpSessions } from "./omp-store.js";
+import { resolveEntryById } from "./pairing.js";
+import { cwdFromSessionFile, foreignWriterPid, OMP_SESSIONS_ROOT, sessionHeaderId } from "./omp-store.js";
 import { supervisor } from "./supervisor.js";
 import { STORAGE_RECONCILE_INTERVAL_MS } from "./knobs.js";
-import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents, readWebuiPreset, writeWebuiArtifact } from "./permission.js";
+import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents } from "./permission.js";
 import { ompProviderIds } from "./models.js";
+import { closeBridgeStore, getBridgeStore, initBridgeStore } from "./store/index.js";
+import { reconcileOnce, upsertCreated } from "./store/reconcile.js";
 
 /** Bounded grace for avoidance hand-off: abort then wait this long before forced teardown. */
 const AVOIDANCE_GRACE_MS = 10_000;
@@ -104,13 +106,22 @@ export class OmpProvider extends Service implements AgentFactory {
     this.runtime = { ctx };
     ctx.effect(() => ctx.agents.setFactory(this), "ompProvider.setFactory()");
     this.#registerModelCatalog();
+    // Boot the centralized index BEFORE any service reads session state: warm
+    // pass + migration, so the first landing sees real titles/models (D5.1).
+    initBridgeStore();
     // Phase B surfaces: the union persistence (Dash JSONL logs ⊕ OMP's native
     // store scan) serves session.list / cold history / resume ownership, and
     // the single-preset roster puts one "OMP" entry on the mode dropdown and
     // the Settings → Agent Preset tab. Both self-register on child fibers, so
     // they load with this plugin — before any dependent service initializes.
     ctx.plugin(OmpUnionSessionPersistence);
-    ctx.plugin(SingleOmpPresetRoster);
+    // The roster must be visible to the API gateway's root-level remote
+    // enumeration (dsh-host-apiproxy read it from the root service table);
+    // nesting it under a child fiber via ctx.plugin hides its @Remote routes
+    // from the gateway and every agentPresets/* call 404s. Register it on
+    // this plugin's own (top-level) fiber instead — its Service constructor
+    // ties teardown to this fiber via reflect.provide.
+    new SingleOmpPresetRoster(ctx);
     // Session supervisor: state machine + cold projection + foreign detection.
     // `ctx.logger` output is not captured by the systemd journal in this
     // profile; supervisor events are load-bearing (avoidance), so mirror them
@@ -124,6 +135,7 @@ export class OmpProvider extends Service implements AgentFactory {
     this.stopFollow = supervisor.startFollow();
     supervisor.onAvoidance((id) => void this.handleAvoidance(id));
     ctx.effect(() => () => this.stopFollow(), "ompProvider.followStop()");
+    ctx.effect(() => () => closeBridgeStore(), "ompProvider.storeClose()");
     this.#reconcileWorkspaces();
   }
 
@@ -144,6 +156,8 @@ export class OmpProvider extends Service implements AgentFactory {
       const registry = wctx.get("workspaceRegistry") as WorkspaceRegistrySlice | undefined;
       if (registry === undefined) return;
       const run = (): void => {
+        const store = getBridgeStore();
+        if (store !== undefined) reconcileOnce(store);
         void this.#attachScannedSessions(registry);
         supervisor.reconcile();
       };
@@ -173,10 +187,12 @@ export class OmpProvider extends Service implements AgentFactory {
         }
       }
       const groups = new Map<string, string[]>();
-      for (const entry of scanOmpSessions().values()) {
-        const cwd = validatedCwd(entry.cwd);
+      const store = getBridgeStore();
+      if (store === undefined) return;
+      for (const row of store.list()) {
+        const cwd = validatedCwd(row.cwd ?? undefined);
         if (cwd === undefined || excluded.has(cwd)) continue;
-        const id = dashIdOf(entry);
+        const id = row.dsh_session_id;
         const ids = groups.get(cwd);
         if (ids === undefined) groups.set(cwd, [id]);
         else if (!ids.includes(id)) ids.push(id);
@@ -251,7 +267,13 @@ export class OmpProvider extends Service implements AgentFactory {
       const state = await rpc.getState();
 
       if (state.sessionFile !== undefined) {
-        writeWebuiArtifact(state.sessionFile, { dashSessionId: id, ...(preset === undefined ? {} : { preset }) });
+        const store = getBridgeStore();
+        if (store !== undefined) {
+          const ompId = state.sessionId ?? sessionHeaderId(state.sessionFile);
+          if (ompId !== undefined) {
+            upsertCreated(store, { ompSessionId: ompId, sessionFile: state.sessionFile, dshSessionId: id, ...(cwd === undefined ? {} : { cwd }), ...(preset === undefined ? {} : { preset }) });
+          }
+        }
       }
 
       // Prepare the unpublished session (mirrors dsh-agent-loop's SessionPreparation).
@@ -323,7 +345,7 @@ export class OmpProvider extends Service implements AgentFactory {
     // OMP_APPROVAL_MODE (headless runs) overrides; no preset → native yolo.
     const envMode = envApprovalMode();
     const preset =
-      readWebuiPreset(sessionFile) ??
+      getBridgeStore()?.byDshId(String(id))?.permission_preset ??
       (persistence !== undefined
         ? presetFromEvents((await persistence.load(id)).events)
         : undefined);

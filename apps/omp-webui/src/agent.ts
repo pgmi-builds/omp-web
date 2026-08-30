@@ -36,7 +36,7 @@ import type {
   UserMessage,
 } from "@deepseek-ai/dsh-session";
 import type { AssistantMessage, ContentBlock, StreamChunk, TokenUsage } from "@deepseek-ai/dsh-llm";
-import { CallId, QUOTA_EXCEEDED_CODE, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { ToolCallId, QUOTA_EXCEEDED_CODE, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { createScope, type Scope } from "@deepseek-ai/dsh-scope";
 import type { ApprovalOutcome, ApprovalService } from "@deepseek-ai/dsh-user-approval";
 import type { OmpAssistantMessageEvent, OmpContentBlock, OmpMessage, OmpRpcClient, RpcEvent } from "./rpc.js";
@@ -44,6 +44,7 @@ import type { OmpAssistantMessageEvent, OmpContentBlock, OmpMessage, OmpRpcClien
 // compilation (the runtime service is mounted by the base bundle).
 import type {} from "@deepseek-ai/dsh-commands";
 import { supervisor } from "./supervisor.js";
+import { getBridgeStore } from "./store/index.js";
 
 /** Diagnostic trace (set OMP_TRACE=1 on the dsh process to enable). */
 const TRACE = process.env.OMP_TRACE === "1";
@@ -66,7 +67,7 @@ export function convertContent(blocks: OmpContentBlock[] | undefined): ContentBl
         const id = typeof block.id === "string" ? block.id : "";
         const name = typeof block.name === "string" ? block.name : "";
         const args = typeof block.arguments === "string" ? block.arguments : JSON.stringify(block.arguments ?? {});
-        result.push({ type: "tool-call", id: CallId(id), name, arguments: args });
+        result.push({ type: "tool-call", id: ToolCallId(id), name, arguments: args });
         break;
       }
       default:
@@ -550,12 +551,21 @@ export class OmpAgent implements Agent {
     const ompModel = state?.model;
     if (ompModel?.provider === target.provider && ompModel?.id === target.model) {
       this.#lastSyncedModel = key;
+      this.#recordModel(target);
       return;
     }
     await this.#rpc.setModel(target.provider, target.model).catch((error) => {
       trace(`set_model ${key} failed: ${String(error)}`);
     });
     this.#lastSyncedModel = key;
+    this.#recordModel(target);
+  }
+
+  /** Event-driven index update: mirror the live model switch immediately (D5.3). */
+  #recordModel(target: { provider: string; model: string }): void {
+    const store = getBridgeStore();
+    if (store === undefined) return;
+    store.updateModel(String(this.session.id), target.provider, target.model);
   }
 
   #openTurn(message: UserMessage, localUser = true): void {
@@ -762,7 +772,7 @@ export class OmpAgent implements Agent {
         this.session.append("tool/call", {
           turn: this.#dashTurn,
           step: this.#step,
-          callId: CallId(callId),
+          callId: ToolCallId(callId),
           name,
           arguments: JSON.stringify(event.args ?? {}),
         });
@@ -857,7 +867,7 @@ export class OmpAgent implements Agent {
     const title = typeof event.title === "string" ? event.title : "";
     const pending = this.#matchPendingToolCall(title);
     const toolName = pending !== null && pending.name !== "" ? pending.name : approvalToolName(title);
-    const callId = pending !== null ? CallId(pending.callId) : undefined;
+    const callId = pending !== null ? ToolCallId(pending.callId) : undefined;
     const reason = title !== "" ? title : undefined;
 
     // `ctx.approval` is provided by a sibling fiber in the real profile, so a
@@ -943,7 +953,7 @@ export class OmpAgent implements Agent {
     const result = event.result as { content?: OmpContentBlock[]; isError?: boolean } | undefined;
     const isError = Boolean(event.isError ?? result?.isError ?? false);
     const message = createToolResultMessage({
-      callId: CallId(callId),
+      callId: ToolCallId(callId),
       content: convertContent(result?.content),
       isError,
     });
@@ -965,7 +975,7 @@ export class OmpAgent implements Agent {
     this.#bridgedToolResults.add(callId);
     const isError = Boolean(message.isError ?? false);
     const result = createToolResultMessage({
-      callId: CallId(callId),
+      callId: ToolCallId(callId),
       content: convertContent(message.content),
       isError,
     });

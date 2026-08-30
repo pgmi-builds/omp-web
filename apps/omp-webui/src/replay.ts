@@ -13,10 +13,11 @@
  * The emitted events carry contiguous `seq` from 0 and safe-integer `time`
  * values, exactly what `Session`'s seed validator requires.
  */
-import { CallId, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { ToolCallId, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import type { SessionEvent, TurnEndReason } from "@deepseek-ai/dsh-session";
 import type { OmpMessage } from "./rpc.js";
 import { convertContent, convertUsage, ompFailure } from "./agent.js";
+import { lastModelCall } from "./omp-store.js";
 
 /** The OMP tool-call block shape inside an assistant message's content. */
 interface OmpToolCallBlock {
@@ -90,7 +91,7 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
         push("step/start", { turn, step });
         for (const block of (message.content ?? []) as OmpToolCallBlock[]) {
           if (block.type !== "toolCall") continue;
-          const callId = CallId(typeof block.id === "string" ? block.id : "");
+          const callId = ToolCallId(typeof block.id === "string" ? block.id : "");
           const name = typeof block.name === "string" ? block.name : "";
           const args = typeof block.arguments === "string" ? block.arguments : JSON.stringify(block.arguments ?? {});
           push("tool/call", { turn, step, callId, name, arguments: args });
@@ -118,7 +119,7 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
           stepOpen = true;
           push("step/start", { turn, step });
         }
-        const callId = CallId(String(message.toolCallId ?? ""));
+        const callId = ToolCallId(String(message.toolCallId ?? ""));
         const isError = Boolean(message.isError ?? false);
         const result = createToolResultMessage({ callId, content: convertContent(message.content), isError });
         push(
@@ -136,24 +137,6 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
 
   closeTurn();
   return events;
-}
-
-/**
- * The session's last model call, from the last assistant message that names a
- * provider/model pair. OMP restores exactly this model on `--resume`; the
- * replayed Dash log records it as a `request/header` event so the model
- * selector resolves the session's OWN model (upstream's tier-2 selection)
- * instead of falling through to the global default.
- */
-function lastModelCall(messages: OmpMessage[]): { provider: string; model: string } | undefined {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message.role !== "assistant") continue;
-    const provider = typeof message.provider === "string" ? message.provider : "";
-    const model = typeof message.model === "string" ? message.model : "";
-    if (provider !== "" && model !== "") return { provider, model };
-  }
-  return undefined;
 }
 
 /**

@@ -25,6 +25,10 @@ export interface OmpNativeSession {
   readonly createdAt: number;
   /** Display title: the title record, else the first user message, else absent. */
   readonly title?: string;
+  /** Transcript byte size (reconcile change detection). */
+  readonly size: number;
+  /** Transcript mtime, epoch ms (reconcile change detection + default sort). */
+  readonly mtimeMs: number;
   /** Opaque change token (stat-derived), for persistence snapshot revisions. */
   readonly revision: string;
 }
@@ -90,6 +94,22 @@ export function readOmpMessages(path: string): OmpMessage[] {
     messages.push({ ...msg, role } as OmpMessage);
   }
   return messages;
+}
+
+/**
+ * The session's last model call, from the last assistant message that names a
+ * provider/model pair. OMP restores exactly this model on `--resume`; the
+ * index stores it as `model_provider` / `model_id`.
+ */
+export function lastModelCall(messages: OmpMessage[]): { provider: string; model: string } | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "assistant") continue;
+    const provider = typeof message.provider === "string" ? message.provider : "";
+    const model = typeof message.model === "string" ? message.model : "";
+    if (provider !== "" && model !== "") return { provider, model };
+  }
+  return undefined;
 }
 
 /**
@@ -217,6 +237,11 @@ function scanHead(path: string): HeadScan {
   return out;
 }
 
+/** Read one session file's header id (the `session` record's `id`), no full scan. */
+export function sessionHeaderId(path: string): string | undefined {
+  return scanHead(path).ompSessionId;
+}
+
 /**
  * Scan OMP's native store. Returns sessions keyed by OMP session id; files
  * without a parsable `session` header record are skipped (corrupt/foreign).
@@ -260,6 +285,8 @@ export function scanOmpSessions(): Map<string, OmpNativeSession> {
             : {
                 ompSessionId: head.ompSessionId,
                 ompSessionFile: path,
+                size,
+                mtimeMs,
                 ...(head.cwd === undefined ? {} : { cwd: head.cwd }),
                 createdAt: head.createdAt ?? createdAtFromFileName(fileName) ?? 0,
                 ...(head.title !== undefined

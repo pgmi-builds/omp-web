@@ -9,8 +9,15 @@
  * whose composition is deliberately empty — mounting it composes nothing,
  * exactly the rosterless behavior the provider runs on.
  */
-import { Service, type Context } from "@deepseek-ai/cordis";
-import { UnknownPresetError, type AgentPreset } from "@deepseek-ai/dsh-agent-presets";
+import { type Context } from "@deepseek-ai/cordis";
+import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
+import { type Agent } from "@deepseek-ai/dsh-agent";
+import {
+  UnknownPresetError,
+  type AgentPreset,
+  type AgentPresetDocument,
+  type AgentPresetRoster,
+} from "@deepseek-ai/dsh-agent-presets";
 import type { ScopeKey } from "@deepseek-ai/dsh-scope";
 
 const OMP_PRESET: AgentPreset = Object.freeze({
@@ -35,7 +42,7 @@ const COMPOSITION_TEXT = [
 /** The standing scope key every `omp` session reads presenters through. */
 const STANDING_KEY: ScopeKey = {};
 
-export class SingleOmpPresetRoster extends Service {
+export class SingleOmpPresetRoster extends TypertRemoteService {
   constructor(ctx: Context) {
     super(ctx, "agentPresets");
   }
@@ -72,6 +79,57 @@ export class SingleOmpPresetRoster extends Service {
   async read(id: string): Promise<string> {
     await this.resolve(id);
     return COMPOSITION_TEXT;
+  }
+
+  // ── Remote RPC surface (alpha: agentPresets routes come from @Remote) ────
+  // The stock dsh-host-apiproxy mapped cordis methods to routes; alpha serves
+  // them from @Remote decorators on a TypertRemoteService. A plain Service
+  // registers no routes, which is why Settings → Agent Preset 404'd.
+
+  @Remote("list")
+  async remoteList(): Promise<AgentPresetRoster> {
+    if (process.env.OMP_TRACE === "1") process.stderr.write("[omp-roster] remoteList INVOKED\n");
+    return {
+      presets: [
+        {
+          id: OMP_PRESET.id,
+          trust: OMP_PRESET.trust,
+          isDefault: true,
+          name: OMP_PRESET.name,
+          description: OMP_PRESET.description,
+        },
+      ],
+      authorable: this.authorable,
+    };
+  }
+
+  @Remote("read")
+  async remoteRead(agentPreset: string): Promise<AgentPresetDocument> {
+    const preset = await this.resolve(agentPreset);
+    return {
+      agentPreset: preset.id,
+      trust: preset.trust,
+      content: await this.read(preset.id),
+      name: preset.name,
+      description: preset.description,
+    };
+  }
+
+  @Remote("copy")
+  async remoteCopy(from: string, id: string, name?: string): Promise<void> {
+    await this.copy(from, id, name);
+  }
+
+  @Remote("deletePreset")
+  async remoteDelete(id: string): Promise<void> {
+    await this.remove(id);
+  }
+
+  /** Fixed roster: one preset, so selecting it is a no-op ack; anything else is unknown. */
+  @Remote("select")
+  async remoteSelect(agent: Agent, agentPreset: string): Promise<string> {
+    const preset = await this.resolve(agentPreset);
+    return preset.id;
   }
 
   async copy(_from: string, _id: string, _name?: string): Promise<void> {

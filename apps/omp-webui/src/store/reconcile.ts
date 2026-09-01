@@ -14,7 +14,7 @@
  */
 import { readFileSync, statSync } from "node:fs";
 import type { BridgeStore, SessionRow } from "./db.js";
-import { lastModelCall, readOmpMessages, scanOmpSessions, type OmpNativeSession } from "../omp-store.js";
+import { lastModelCall, lastRestorableModel, readOmpTranscript, scanOmpSessions, type OmpNativeSession } from "../omp-store.js";
 import { isPresetName, webuiArtifactPath } from "../permission.js";
 
 /** The Dash-format prefix apiproxy mints; derived ids reuse it verbatim. */
@@ -31,8 +31,8 @@ export function derivedDashId(ompSessionId: string): string {
  * pairing, and preset.
  */
 function rowFromEntry(entry: OmpNativeSession, existing?: SessionRow): SessionRow {
-  const messages = readOmpMessages(entry.ompSessionFile);
-  const model = lastModelCall(messages);
+  const { messages, modelChanges } = readOmpTranscript(entry.ompSessionFile);
+  const model = lastRestorableModel(modelChanges) ?? lastModelCall(messages);
   return {
     omp_session_id: entry.ompSessionId,
     dsh_session_id: existing?.dsh_session_id ?? derivedDashId(entry.ompSessionId),

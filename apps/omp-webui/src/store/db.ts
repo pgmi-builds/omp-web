@@ -244,6 +244,26 @@ export class BridgeStore {
     this.run("INSERT INTO ui_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value);
   }
 
+  /** The tracked OMP default model (`modelRoles.default`), or undefined when unset. */
+  getOmpDefaultModel(): { provider: string; model: string } | undefined {
+    const raw = this.getUiState("omp_default_model");
+    if (raw === undefined) return undefined;
+    try {
+      const parsed = JSON.parse(raw) as { provider?: unknown; model?: unknown };
+      if (typeof parsed.provider === "string" && typeof parsed.model === "string") {
+        return { provider: parsed.provider, model: parsed.model };
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+
+  /** Persist the tracked OMP default model. */
+  setOmpDefaultModel(provider: string, model: string): void {
+    this.setUiState("omp_default_model", JSON.stringify({ provider, model }));
+  }
+
   /** Event-driven model update after a live model switch (D5.3). */
   updateModel(dshSessionId: string, provider: string | null, model: string | null): void {
     this.run("UPDATE sessions SET model_provider = ?, model_id = ? WHERE dsh_session_id = ?", provider, model, dshSessionId);

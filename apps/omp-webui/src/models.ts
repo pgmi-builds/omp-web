@@ -11,9 +11,9 @@
  * for this install (~840 models with per-model compat/thinking metadata) and
  * so reliably fails with `RPC response exceeded the transport limit`.
  *
- *   1. `~/.omp/agent/models.db` (`model_cache.models`, the on-disk cache the
+ *   1. `$OMP_HOME/agent/models.db` (`model_cache.models`, the on-disk cache the
  *      registry refreshes into) — the complete authoritative list.
- *   2. `~/.omp/agent/models.yml` (the user overlay, e.g. `bailian`) — merged
+ *   2. `$OMP_HOME/agent/models.yml` (the user overlay, e.g. `bailian`) — merged
  *      over the cache so user-declared providers that OMP never caches are
  *      still advertised.
  *
@@ -40,7 +40,7 @@ export interface OmpModel {
   thinking?: { mode?: string; efforts?: string[]; defaultLevel?: string };
 }
 
-const OMP_AGENT_DIR = join(homedir(), ".omp", "agent");
+const OMP_AGENT_DIR = join(process.env.OMP_HOME ?? join(homedir(), ".omp"), "agent");
 
 /** Providers OMP's config.yml `modelRoles` actually names, listed first for a clean selector. */
 const PREFERRED_PROVIDERS = ["deepseek", "zai", "bailian"];

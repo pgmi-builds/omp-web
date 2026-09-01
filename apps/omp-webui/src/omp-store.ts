@@ -62,18 +62,32 @@ function fallbackTitle(text: string): string | undefined {
   return collapsed.length === 0 ? undefined : collapsed.slice(0, FALLBACK_TITLE_CHARS);
 }
 
+/** One OMP `model_change` entry from a session transcript. */
+export interface OmpModelChange {
+  /** `provider/model` selector string. */
+  readonly model: string;
+  /** The role this change records (absent on the initial restore). */
+  readonly role?: string;
+}
+
+/** The two record families cold replay needs from one transcript read. */
+export interface OmpTranscript {
+  messages: OmpMessage[];
+  modelChanges: OmpModelChange[];
+}
+
 /**
- * Read one OMP session transcript's full message list (`{"type":"message"}`
- * records, in file order). This is the same shape `get_messages` returns for
- * a live session; cold history replay consumes it directly.
+ * Read one OMP session transcript in a single pass, extracting both the
+ * `message` records and the `model_change` records.
  */
-export function readOmpMessages(path: string): OmpMessage[] {
+export function readOmpTranscript(path: string): OmpTranscript {
   const messages: OmpMessage[] = [];
+  const modelChanges: OmpModelChange[] = [];
   let buffer: string;
   try {
     buffer = readFileSync(path, "utf8");
   } catch {
-    return messages;
+    return { messages, modelChanges };
   }
   for (const line of buffer.split("\n")) {
     if (line === "") continue;
@@ -85,21 +99,26 @@ export function readOmpMessages(path: string): OmpMessage[] {
     }
     if (record === null || typeof record !== "object") continue;
     const rec = record as Record<string, unknown>;
-    if (rec["type"] !== "message") continue;
-    const message = rec["message"];
-    if (message === null || typeof message !== "object") continue;
-    const msg = message as Record<string, unknown>;
-    const role = msg["role"];
-    if (role !== "user" && role !== "assistant" && role !== "toolResult") continue;
-    messages.push({ ...msg, role } as OmpMessage);
+    if (rec["type"] === "message") {
+      const message = rec["message"];
+      if (message === null || typeof message !== "object") continue;
+      const msg = message as Record<string, unknown>;
+      const role = msg["role"];
+      if (role !== "user" && role !== "assistant" && role !== "toolResult") continue;
+      messages.push({ ...msg, role } as OmpMessage);
+    } else if (rec["type"] === "model_change") {
+      const model = rec["model"];
+      if (typeof model !== "string" || model === "") continue;
+      modelChanges.push({ model, role: typeof rec["role"] === "string" ? rec["role"] : undefined });
+    }
   }
-  return messages;
+  return { messages, modelChanges };
 }
 
 /**
- * The session's last model call, from the last assistant message that names a
- * provider/model pair. OMP restores exactly this model on `--resume`; the
- * index stores it as `model_provider` / `model_id`.
+ * Legacy fallback: the last assistant message that names a provider/model
+ * pair. Used only for transcripts without any `model_change` record; newer
+ * sessions derive their resume model from {@link lastRestorableModel}.
  */
 export function lastModelCall(messages: OmpMessage[]): { provider: string; model: string } | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -108,6 +127,80 @@ export function lastModelCall(messages: OmpMessage[]): { provider: string; model
     const provider = typeof message.provider === "string" ? message.provider : "";
     const model = typeof message.model === "string" ? message.model : "";
     if (provider !== "" && model !== "") return { provider, model };
+  }
+  return undefined;
+}
+
+/** Split a `provider/model[:variant]` selector into provider/model, dropping the variant suffix. */
+function parseSelector(selector: string | undefined): { provider: string; model: string } | undefined {
+  if (selector === undefined) return undefined;
+  const slash = selector.indexOf("/");
+  if (slash <= 0) return undefined;
+  let model = selector.slice(slash + 1);
+  const colon = model.indexOf(":");
+  if (colon > 0) model = model.slice(0, colon);
+  return { provider: selector.slice(0, slash), model };
+}
+
+/**
+ * The model OMP restores on `--resume`: the last non-fallback `model_change`.
+ * Mirrors OMP's `getRestorableSessionModels` (`session-context.ts`): a
+ * fallback switch is recorded under `role:"fallback"` (EPHEMERAL) and never
+ * restores — the last such switch falls back to the role's primary.
+ */
+export function lastRestorableModel(modelChanges: OmpModelChange[]): { provider: string; model: string } | undefined {
+  const models: Record<string, string> = {};
+  let lastRole: string | undefined;
+  for (const change of modelChanges) {
+    const role = change.role ?? "default";
+    models[role] = change.model;
+    lastRole = change.role;
+  }
+  const selector =
+    lastRole === undefined || lastRole === "default" || lastRole === "fallback"
+      ? models["default"]
+      : (models[lastRole] ?? models["default"]);
+  return parseSelector(selector);
+}
+
+/**
+ * Path to OMP's per-user agent config (`$OMP_HOME/agent/config.yml`).
+ *
+ * This is the OMP layer's own config, distinct from dsh's settings layer:
+ * upstream dsh keeps a home-level singleton settings document
+ * (`$DSH_HOME/settings.yaml`); the profile only composes bundles and has no
+ * per-profile settings isolation of its own. This bridge never reads that
+ * settings.yaml — OMP data lives under `$OMP_HOME`, and the bridge's own
+ * index under `$DSH_HOME/bridge-store.sqlite` (see store/index.ts).
+ */
+function ompConfigPath(): string {
+  return join(process.env.OMP_HOME ?? join(homedir(), ".omp"), "agent", "config.yml");
+}
+
+/**
+ * Read the configured default role model (`modelRoles.default`) from OMP's
+ * config.yml. Returns the provider/model pair (variant suffix dropped), or
+ * undefined when unset or unreadable. A deliberately minimal YAML scan — the
+ * bridge has no YAML dependency and only needs this one value.
+ */
+export function readOmpDefaultModelFromConfig(): { provider: string; model: string } | undefined {
+  let text: string;
+  try {
+    text = readFileSync(ompConfigPath(), "utf8");
+  } catch {
+    return undefined;
+  }
+  let inModelRoles = false;
+  for (const line of text.split("\n")) {
+    if (/^modelRoles:\s*$/.test(line)) {
+      inModelRoles = true;
+      continue;
+    }
+    if (inModelRoles) {
+      if (line !== "" && !/^\s/.test(line)) break; // left the modelRoles block
+      const match = /^\s*default:\s*(\S+)/.exec(line);
+      if (match !== null) return parseSelector(match[1]);
+    }
   }
   return undefined;
 }

@@ -17,7 +17,7 @@ import { ToolCallId, createAssistantMessage, createToolResultMessage, createUser
 import type { SessionEvent, TurnEndReason } from "@deepseek-ai/dsh-session";
 import type { OmpMessage } from "./rpc.js";
 import { convertContent, convertUsage, ompFailure } from "./agent.js";
-import { lastModelCall } from "./omp-store.js";
+import { lastModelCall, lastRestorableModel, type OmpModelChange } from "./omp-store.js";
 
 /** The OMP tool-call block shape inside an assistant message's content. */
 interface OmpToolCallBlock {
@@ -35,7 +35,19 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
   let turnOpen = false;
   let stepOpen = false;
   let turnFailure: { message: string; code: string } | null = null;
-  let time = Date.now();
+  // Seeded from the first OMP message's own `timestamp` (epoch ms). The old
+  // `Date.now()` base collapsed the whole transcript to the replay instant and
+  // mixed with live-event wall-clock times, misordering later messages.
+  let time = 0;
+
+  const seedTime = (message: OmpMessage): void => {
+    const timestamp = message.timestamp;
+    if (typeof timestamp === "number" && Number.isSafeInteger(timestamp) && timestamp > 0) {
+      time = Math.max(time, timestamp);
+    } else if (time === 0) {
+      time = Date.now();
+    }
+  };
 
   const push = (
     type: string,
@@ -61,6 +73,7 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
   };
 
   for (const message of messages) {
+    seedTime(message);
     switch (message.role) {
       case "user": {
         closeTurn();
@@ -147,9 +160,14 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
  * last model (see {@link lastModelCall}), followed by the message replay,
  * with contiguous `seq` renumbered from 0.
  */
-export function replayOmpTranscript(messages: OmpMessage[], title?: string, titleTime?: number): SessionEvent[] {
+export function replayOmpTranscript(
+  messages: OmpMessage[],
+  title?: string,
+  titleTime?: number,
+  modelChanges?: OmpModelChange[],
+): SessionEvent[] {
   const replayed = replayOmpMessages(messages);
-  const config = lastModelCall(messages);
+  const config = lastRestorableModel(modelChanges ?? []) ?? lastModelCall(messages);
   if (title === undefined || title.length === 0) {
     if (config === undefined) return replayed;
     return [

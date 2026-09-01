@@ -13,9 +13,14 @@ let store: BridgeStore | undefined;
 
 /**
  * Resolve the index path: `OMP_BRIDGE_DB` (absolute) or the profile's own
- * state dir. Throws on a relative/invalid path, or one that falls inside
- * OMP's native store (D7: OMP scans that dir and would treat the `.sqlite`
- * as a foreign session file).
+ * state dir (`$DSH_HOME/bridge-store.sqlite`). Throws on a relative/invalid
+ * path, or one that falls inside OMP's native store (D7: OMP scans that dir
+ * and would treat the `.sqlite` as a foreign session file).
+ *
+ * `$DSH_HOME` also anchors dsh's home-level singleton settings document
+ * (`$DSH_HOME/settings.yaml`), which this bridge never reads; the profile
+ * isolates that document via its own `settings.path` patch (settings-under-
+ * profile), independent of this store.
  */
 export function resolveBridgeDbPath(): string {
   const explicit = process.env.OMP_BRIDGE_DB;

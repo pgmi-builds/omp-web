@@ -31,7 +31,7 @@ import {
   type SessionEvent,
   type SessionHeader,
 } from "@deepseek-ai/dsh-session";
-import { readOmpMessages } from "./omp-store.js";
+import { readOmpTranscript } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
 import { supervisor } from "./supervisor.js";
 import { isPresetName, permissionEventsFor } from "./permission.js";
@@ -119,7 +119,8 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
     if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs && cached.preset === preset) {
       return cached.events;
     }
-    const replayed = replayOmpTranscript(readOmpMessages(row.session_file), row.title ?? undefined, row.created_at);
+    const { messages, modelChanges } = readOmpTranscript(row.session_file);
+    const replayed = replayOmpTranscript(messages, row.title ?? undefined, row.created_at, modelChanges);
     const events =
       preset !== undefined && isPresetName(preset)
         ? [...permissionEventsFor(preset, row.created_at), ...replayed].map((event, index) => ({

@@ -39,7 +39,7 @@ import { OmpLlmAdapter } from "./adapter.js";
 import { OmpUnionSessionPersistence } from "./session-persistence-omp.js";
 import { SingleOmpPresetRoster } from "./agent-preset-omp.js";
 import { resolveEntryById } from "./pairing.js";
-import { cwdFromSessionFile, foreignWriterPid, OMP_SESSIONS_ROOT, sessionHeaderId } from "./omp-store.js";
+import { cwdFromSessionFile, foreignWriterPid, OMP_SESSIONS_ROOT, readOmpDefaultModelFromConfig, sessionHeaderId } from "./omp-store.js";
 import { supervisor } from "./supervisor.js";
 import { STORAGE_RECONCILE_INTERVAL_MS } from "./knobs.js";
 import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents } from "./permission.js";
@@ -100,6 +100,8 @@ export class OmpProvider extends Service implements AgentFactory {
   private stopFollow: () => void = () => {};
   /** Live RPC-backed agents by dash id, for avoidance hand-off. */
   private readonly heldAgents = new Map<string, AgentHandle>();
+  /** Last synced OMP default model key (`provider/model`), to skip no-op syncs. */
+  #lastOmpDefaultModelKey = "";
 
   constructor(ctx: Context) {
     super(ctx, "ompProvider");
@@ -109,6 +111,7 @@ export class OmpProvider extends Service implements AgentFactory {
     // Boot the centralized index BEFORE any service reads session state: warm
     // pass + migration, so the first landing sees real titles/models (D5.1).
     initBridgeStore();
+    this.#syncOmpDefaultModel();
     // Phase B surfaces: the union persistence (Dash JSONL logs ⊕ OMP's native
     // store scan) serves session.list / cold history / resume ownership, and
     // the single-preset roster puts one "OMP" entry on the mode dropdown and
@@ -140,6 +143,27 @@ export class OmpProvider extends Service implements AgentFactory {
   }
 
   /**
+   * Track OMP's `modelRoles.default` (config.yml) into the store's
+   * `omp_default_model` and DSH's `ctx.agentDefaultModel`, so new sessions start
+   * from the same default the OMP TUI uses. No-op unless the value changed.
+   */
+  #syncOmpDefaultModel(): void {
+    const fromConfig = readOmpDefaultModelFromConfig();
+    const key = fromConfig === undefined ? "" : `${fromConfig.provider}/${fromConfig.model}`;
+    if (key === this.#lastOmpDefaultModelKey) return;
+    this.#lastOmpDefaultModelKey = key;
+    if (fromConfig === undefined) return;
+    getBridgeStore()?.setOmpDefaultModel(fromConfig.provider, fromConfig.model);
+    const service = this.runtime.ctx.get("agentDefaultModel") as
+      | { saveSelection?: (selection: { provider: string; model: string }) => Promise<unknown> }
+      | undefined;
+    void service?.saveSelection?.({ provider: fromConfig.provider, model: fromConfig.model }).catch((error: unknown) => {
+      this.runtime.ctx.logger.warn(`omp-provider: default model sync failed: ${String(error)}`);
+    });
+  }
+
+
+  /**
    * Reconcile the Web UI workspace sidebar against the scanned OMP store.
    *
    * The upstream workspace registry (`dsh-workspace`) only auto-groups by cwd
@@ -158,6 +182,7 @@ export class OmpProvider extends Service implements AgentFactory {
       const run = (): void => {
         const store = getBridgeStore();
         if (store !== undefined) reconcileOnce(store);
+        this.#syncOmpDefaultModel();
         void this.#attachScannedSessions(registry);
         supervisor.reconcile();
       };

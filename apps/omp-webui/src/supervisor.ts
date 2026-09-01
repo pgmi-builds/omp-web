@@ -15,7 +15,7 @@
 import { statSync } from "node:fs";
 import { SessionPreparation, type Session, type SessionEvent } from "@deepseek-ai/dsh-session";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
-import { readOmpMessages, scanForeignWriters } from "./omp-store.js";
+import { readOmpTranscript, scanForeignWriters } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
 import { getBridgeStore } from "./store/index.js";
 import { FILE_FOLLOW_INTERVAL_MS, SHADOW_TTL_MS, TRANSITION_FOLLOW_INTERVAL_MS } from "./knobs.js";
@@ -64,6 +64,8 @@ interface Entry {
   externalNoted: boolean;
   /** Avoidance hit while no shadow projection existed (create-held); note on materialize. */
   pendingNote: boolean;
+  /** Guards the async shadow materialize against concurrent re-entry (same-id double enter). */
+  materializing: boolean;
   lastViewedAt: number;
   lastFollowAt: number;
   knownUserTexts: Set<string>;
@@ -92,7 +94,10 @@ export class Supervisor {
   noteView(id: string): void {
     const entry = this.#entry(id);
     entry.lastViewedAt = Date.now();
-    if (entry.role === "cold" && this.sessions !== undefined) void this.#materialize(id, entry);
+    if (entry.role === "cold" && !entry.materializing && this.sessions !== undefined) {
+      entry.materializing = true;
+      void this.#materialize(id, entry);
+    }
   }
   /** Sync entries against the store; drop gone files; refresh role-agnostic state. */
   reconcile(): void {
@@ -104,7 +109,7 @@ export class Supervisor {
       seen.add(id);
       const entry = this.entries.get(id);
       if (entry === undefined) {
-        this.entries.set(id, { role: "cold", file: row.session_file, title: row.title ?? undefined, createdAt: row.created_at, lastViewedAt: 0, lastFollowAt: 0, externalNoted: false, pendingNote: false, knownUserTexts: new Set() });
+        this.entries.set(id, { role: "cold", file: row.session_file, title: row.title ?? undefined, createdAt: row.created_at, lastViewedAt: 0, lastFollowAt: 0, externalNoted: false, pendingNote: false, materializing: false, knownUserTexts: new Set() });
       } else {
         entry.file = row.session_file;
         entry.title = row.title ?? undefined;
@@ -148,7 +153,8 @@ export class Supervisor {
       // Fresh hold without a shadow: baseline at the file's current end so
       // only records written AFTER this point are judged (no history false
       // positives — historical user texts are not in knownUserTexts).
-      const events = replayOmpTranscript(readOmpMessages(file), entry.title, entry.createdAt);
+      const { messages, modelChanges } = readOmpTranscript(file);
+      const events = replayOmpTranscript(messages, entry.title, entry.createdAt, modelChanges);
       entry.cursor = { lastSeq: events.length, size: statSize(file), mtimeMs: statMtime(file) };
     }
   }
@@ -164,7 +170,8 @@ export class Supervisor {
     // Re-baseline the cursor at the file's end: our own child's writes must
     // not read back as foreign on the next watch pass.
     if (entry.cursor !== undefined && entry.file !== "") {
-      const events = replayOmpTranscript(readOmpMessages(entry.file), entry.title, entry.createdAt);
+      const { messages, modelChanges } = readOmpTranscript(entry.file);
+      const events = replayOmpTranscript(messages, entry.title, entry.createdAt, modelChanges);
       entry.cursor = { lastSeq: events.length, size: statSize(entry.file), mtimeMs: statMtime(entry.file) };
     }
     if (entry.role === "shadow" && this.sessions !== undefined && entry.shadow === undefined) {
@@ -210,7 +217,7 @@ export class Supervisor {
   #entry(id: string): Entry {
     let entry = this.entries.get(id);
     if (entry === undefined) {
-      entry = { role: "cold", file: "", lastViewedAt: 0, lastFollowAt: 0, externalNoted: false, pendingNote: false, knownUserTexts: new Set() };
+      entry = { role: "cold", file: "", lastViewedAt: 0, lastFollowAt: 0, externalNoted: false, pendingNote: false, materializing: false, knownUserTexts: new Set() };
       this.entries.set(id, entry);
     }
     return entry;
@@ -270,7 +277,8 @@ export class Supervisor {
       return;
     }
     if (size === cursor.size && mtimeMs === cursor.mtimeMs) return;
-    const events = replayOmpTranscript(readOmpMessages(entry.file), entry.title, entry.createdAt) as ReplayedEvent[];
+    const { messages, modelChanges } = readOmpTranscript(entry.file);
+    const events = replayOmpTranscript(messages, entry.title, entry.createdAt, modelChanges) as ReplayedEvent[];
     if (events.length <= cursor.lastSeq) {
       // Growth-free rewrite (title-slot in-place update): re-baseline stat only.
       cursor.size = size;
@@ -327,9 +335,13 @@ export class Supervisor {
   }
 
   async #materialize(id: string, entry: Entry): Promise<void> {
-    if (entry.shadow !== undefined || this.sessions === undefined) return;
+    if (entry.shadow !== undefined || this.sessions === undefined) {
+      entry.materializing = false;
+      return;
+    }
     const row = getBridgeStore()?.byFile(entry.file);
-    const seed = replayOmpTranscript(readOmpMessages(entry.file), entry.title ?? row?.title ?? undefined, entry.createdAt ?? row?.created_at);
+    const { messages, modelChanges } = readOmpTranscript(entry.file);
+    const seed = replayOmpTranscript(messages, entry.title ?? row?.title ?? undefined, entry.createdAt ?? row?.created_at, modelChanges);
     try {
       const preparation = await SessionPreparation.create(
         this.sessions.prepare(id, {
@@ -350,6 +362,8 @@ export class Supervisor {
       }
     } catch (error) {
       this.log(`materialize ${id} failed: ${String(error)}`);
+    } finally {
+      entry.materializing = false;
     }
   }
 

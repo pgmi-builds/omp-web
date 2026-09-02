@@ -10,12 +10,12 @@
 
 #### Scenario: 宿主已装 dsh（任意 alpha 版本）
 
-- **WHEN** user 已通过 dsh 安装器拥有 `@deepseek-ai/dsh-*`（如 alpha.1/alpha.2），再 `dsh plugin add @pgmi-builds/omp-webui`
+- **WHEN** user 已通过 dsh 安装器拥有 `@deepseek-ai/dsh-*`（如 alpha.1/alpha.2），再 `dsh plugin add @pgmi-builds/omp-web`
 - **THEN** 安装成功，npm 不拉取 alpha.3 副本、不报 peer 版本冲突
 
 #### Scenario: 运行时从宿主解析
 
-- **WHEN** dsh 进程加载 omp-webui provider
+- **WHEN** dsh 进程加载 omp-web provider
 - **THEN** `@deepseek-ai/dsh-agent`/`dsh-llm`/`dsh-session` 等从 dsh 安装的 node_modules（或 profile fallback）解析，不依赖本包自带副本
 
 ### Requirement: peer 版本语义诚实

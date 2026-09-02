@@ -1,6 +1,6 @@
 ## Why
 
-桥接层（omp-webui）当前没有自己的集中式存储：会话列表、id 配对、元数据全部依赖每次请求实时全量扫描 OMP 原生 session store（`~/.omp/agent/sessions`）。随着本地 OMP 会话越来越多，每次 fresh 请求的全量扫描带来线性增长的延迟。需要给桥接层建一个中央索引库（DB 唯一权威），承接会话映射、元数据与 Web UI 的 UI 专属数据（archive / fork / preset / workspace 排序 / last-visited），把请求路径从「全量扫描」降为「索引查询」。
+桥接层（omp-web）当前没有自己的集中式存储：会话列表、id 配对、元数据全部依赖每次请求实时全量扫描 OMP 原生 session store（`~/.omp/agent/sessions`）。随着本地 OMP 会话越来越多，每次 fresh 请求的全量扫描带来线性增长的延迟。需要给桥接层建一个中央索引库（DB 唯一权威），承接会话映射、元数据与 Web UI 的 UI 专属数据（archive / fork / preset / workspace 排序 / last-visited），把请求路径从「全量扫描」降为「索引查询」。
 
 ## What Changes
 
@@ -22,11 +22,11 @@
 
 ### Modified Capabilities
 
-（无——`openspec/specs/` 尚无主规格；本 change 在 `omp-in-dsh` 的 `session-storage` capability 之上叠加索引层，不修改其已定需求。注意：`apps/omp-in-dsh` 近乎原样复用 omp-webui 桥接源码，本 change 的实现将同步被其继承，apply 阶段需回归其会话列表/续聊路径。）
+（无——`openspec/specs/` 尚无主规格；本 change 在 `omp-in-dsh` 的 `session-storage` capability 之上叠加索引层，不修改其已定需求。注意：`apps/omp-in-dsh` 近乎原样复用 omp-web 桥接源码，本 change 的实现将同步被其继承，apply 阶段需回归其会话列表/续聊路径。）
 
 ## Impact
 
-- **新增代码**：`apps/omp-webui/src/store/`（DB 接口、SQLite 索引模块、reconcile、查询接口）。DB 访问隔离在接口后，运行时检测：Bun 用 `bun:sqlite`、Node 用 `node:sqlite`（均零原生依赖）。
+- **新增代码**：`apps/omp-web/src/store/`（DB 接口、SQLite 索引模块、reconcile、查询接口）。DB 访问隔离在接口后，运行时检测：Bun 用 `bun:sqlite`、Node 用 `node:sqlite`（均零原生依赖）。
 - **既有代码**：`omp-store.ts`（扫描器保留，降级为 reconcile 数据源）、`pairing.ts`（反向查找改索引、去 webui.json）、`permission.ts`（preset 改走 DB；webui.json 读写退役）、`session-persistence-omp.ts`（list/history 改索引读取）、`supervisor.ts`（reconcile 接索引）、`index.ts`（启动 warm pass + 迁移 + DB 生命周期）。
 - **运行面**：新旋钮 `OMP_BRIDGE_DB`（DB 文件路径）；复用现有 `OMP_STORAGE_RECONCILE_INTERVAL_MS`（默认 30s）。
 - **部署面**：DB 文件落在桥接层自己的 state 目录，**绝不落入 `OMP_SESSIONS_ROOT`**。

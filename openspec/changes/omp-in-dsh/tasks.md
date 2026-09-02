@@ -7,8 +7,8 @@
 
 ## 2. 包骨架与桥接层
 
-- [x] 2.1 创建 `apps/omp-in-dsh` package（`dsh-omp-in-dsh`：package.json + tsconfig + `dsh.bundle.patch` 声明，peerDeps 对齐 omp-webui），`pnpm install` + `tsc` 空构建通过
-- [x] 2.2 桥接层拷贝：omp-webui 的 rpc/agent/replay/pairing/permission/omp-store/models 原样拷入 `src/bridge/`（共享模式无参数化改动），`tsc` 通过；spawn 目标保留 PATH `omp` 并加 `OMP_BIN` 覆盖
+- [x] 2.1 创建 `apps/omp-in-dsh` package（`dsh-omp-in-dsh`：package.json + tsconfig + `dsh.bundle.patch` 声明，peerDeps 对齐 omp-web），`pnpm install` + `tsc` 空构建通过
+- [x] 2.2 桥接层拷贝：omp-web 的 rpc/agent/replay/pairing/permission/omp-store/models 原样拷入 `src/bridge/`（共享模式无参数化改动），`tsc` 通过；spawn 目标保留 PATH `omp` 并加 `OMP_BIN` 覆盖
 - [x] 2.3 版本握手：按 Spike-3 结论在 RPC 握手后校验版本兼容范围（默认 18.x，`OMP_VERSION_RANGE` 可放宽），超范围拒绝创建并报实际版本；单测覆盖拒绝路径与放宽路径
 
 ## 3. 共存接线（factory / preset / persistence）
@@ -16,8 +16,8 @@
 - [ ] 3.1 RouterFactory：实现 preset/meta 判定 + OMP 分支（调 bridge 的 OmpProvider 逻辑）+ 原生分支（委托子 fiber AgentLoop，含 seed 消毒：seed provider 带 `omp/` 前缀时替换为原生模型）；集成测试覆盖 spec `agent-provider` 三场景（omp 创建、原生不受影响、OMP 故障不外溢——用坏 `OMP_BIN` 路径注入故障）+ `model-catalog` seed 消毒场景
 - [ ] 3.2 preset 贡献：按用户另一项目验证的自定义 preset 路径向原生 roster 注册 `omp` preset；验证 roster 列表同时含全部原生 preset 与 `omp`，且移除 plugin 后原生 preset 完整（spec 场景验收）
 - [ ] 3.3 CompositeSessionPersistence：list 并集 + id 路由（OMP 配对集 → OMP 分支 no-op 写；其余 → 原生后端）；集成测试覆盖混合列表、原生后端故障不拖累 OMP 侧、OMP 会话重启后历史与 store 一致（spec `session-storage` 场景）
-- [ ] 3.4 会话身份与排他：pairing 工件写入本机 OMP store、未知 id 拒绝恢复、`foreignWriterPid` 排他（omp-webui 语义原样）；用户级冒烟：TUI 打开同一文件时 Web UI 接入被明确拒绝、结束的 Web UI 会话可被 TUI 恢复（spec `runtime` 共享场景）
-- [ ] 3.5 workspace reconcile：30s 归组 + warm pass 沿用 omp-webui（扫描 `~/.omp/agent/sessions`、排除 OMP/DSH home）；验证 TUI 创建的会话落入正确 workspace、原生会话归组不变
+- [ ] 3.4 会话身份与排他：pairing 工件写入本机 OMP store、未知 id 拒绝恢复、`foreignWriterPid` 排他（omp-web 语义原样）；用户级冒烟：TUI 打开同一文件时 Web UI 接入被明确拒绝、结束的 Web UI 会话可被 TUI 恢复（spec `runtime` 共享场景）
+- [ ] 3.5 workspace reconcile：30s 归组 + warm pass 沿用 omp-web（扫描 `~/.omp/agent/sessions`、排除 OMP/DSH home）；验证 TUI 创建的会话落入正确 workspace、原生会话归组不变
 
 ## 4. 模型目录与选择
 

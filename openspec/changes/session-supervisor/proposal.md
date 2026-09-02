@@ -1,6 +1,6 @@
 ## Why
 
-桥接守护进程（omp-webui，3081 端口）对 session 生命周期的管理仍是原始形态：idle teardown 只看单一 PID 视角、可能在 agent 仍有存活工作时处决 RPC 进程组（连同全部子 agent）；冷会话被 WebUI 查看后无任何推送通道，视图随即陈旧；独占只有一个 spawn 时点的单向检查（TOCTOU 敞口，持有期不设防）。OMP 上游已验证**无任何 session 锁机制**（transcript 为 plain `openSync(path,"a")`，标题槽头部原地重写），且约定不 patch 上游——TUI 与 WebUI 共享同一 session store 的前提下，守护进程必须自己成为生命周期与数据流的监督者。
+桥接守护进程（omp-web，3081 端口）对 session 生命周期的管理仍是原始形态：idle teardown 只看单一 PID 视角、可能在 agent 仍有存活工作时处决 RPC 进程组（连同全部子 agent）；冷会话被 WebUI 查看后无任何推送通道，视图随即陈旧；独占只有一个 spawn 时点的单向检查（TOCTOU 敞口，持有期不设防）。OMP 上游已验证**无任何 session 锁机制**（transcript 为 plain `openSync(path,"a")`，标题槽头部原地重写），且约定不 patch 上游——TUI 与 WebUI 共享同一 session store 的前提下，守护进程必须自己成为生命周期与数据流的监督者。
 
 ## What Changes
 
@@ -26,7 +26,7 @@
 
 ## Impact
 
-- **修改代码**：`apps/omp-webui/src/`——`index.ts`（resume/create 的三层门与晋升分支）、`agent.ts`（idle 退出五重重验、send 清表）、`omp-store.ts`（单遍收集器）、`session-persistence-omp.ts`（memo 协同）；新增 supervisor 模块（状态机、file-follow、检测扫描、通知合成）。
-- **波及**：`apps/omp-in-dsh` 近乎原样复用 omp-webui 桥接层源码，本 change 的实现将同步被其继承——apply 阶段需回归其会话创建/续聊路径。
+- **修改代码**：`apps/omp-web/src/`——`index.ts`（resume/create 的三层门与晋升分支）、`agent.ts`（idle 退出五重重验、send 清表）、`omp-store.ts`（单遍收集器）、`session-persistence-omp.ts`（memo 协同）；新增 supervisor 模块（状态机、file-follow、检测扫描、通知合成）。
+- **波及**：`apps/omp-in-dsh` 近乎原样复用 omp-web 桥接层源码，本 change 的实现将同步被其继承——apply 阶段需回归其会话创建/续聊路径。
 - **运行面**：四个新节奏旋钮（`OMP_STORAGE_RECONCILE_INTERVAL_MS` / `OMP_FILE_FOLLOW_INTERVAL_MS` / `OMP_TRANSITION_FOLLOW_INTERVAL_MS` / `OMP_SHADOW_TTL_MS`），默认 30s/5s/1s/15min，全部可被 `0` 关闭（除 TTL 外）。
 - **风险**：影子投影复用上游公共原语，两个行为（无 agent session 的 mux 基线、seq 重建后前端收敛）未经实测——已列为 spike task，在实现前打掉。

@@ -34,6 +34,14 @@ export declare class TypertRemoteFailure extends Error {
      */
     constructor(failure: RemoteFailure);
 }
+
+/** One Remote call failure carrying its stable code and typed details (alpha.3). */
+export declare class RemoteError<Code extends string = string> extends Error {
+    readonly code: Code;
+    readonly details: Record<string, unknown>;
+    readonly isDSHRemoteError: true;
+    constructor(code: Code, message: string, details: Record<string, unknown>, options?: ErrorOptions);
+}
 export type { InvocationDescriptor, InvocationParameterDescriptor, InvocationSourceLocation, RemoteFailure, RemoteResult, TypertClientEventListener, TypertClientRemote, TypertClientContextAdapter, TypertCodec, TypertContext, TypertContextAdapter, TypertContextMap, TypertContextRegistry, TypertContextWire, TypertDisposer, TypertForwardableEvent, TypertForwardableEventEntry, TypertHostContextAdapter, TypertHostContextIdentity, TypertHostContextResolver, TypertLocalRegistry, TypertLookup, TypertLookupDefinition, TypertLookupHost, TypertLookupMap, TypertLookupProvider, TypertLookupResolver, TypertLookupRegistry, TypertLookupWire, TypertRemoteScopeApi, TypertRemoteScopeMap, TypertRemoteScopeNamespace, TypertRemoteContribution, TypertRemoteEvent, TypertRemoteEventSelection, TypertRemoteMap, TypertRemoteNamespace, TypertRemoteNamespaceMap, TypertRemoteRegistry, TypertRegistryChange, TypertRegistryListener, TypertSchema, TypertRegistryContract, } from './types.ts';
 /** Options for an explicit Service-to-Gateway binding. */
 export interface TypertGatewayBindingOptions {

@@ -10,10 +10,9 @@
  * exactly the rosterless behavior the provider runs on.
  */
 import { type Context } from "@deepseek-ai/cordis";
-import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
+import { Remote, RemoteError, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { type Agent } from "@deepseek-ai/dsh-agent";
 import {
-  UnknownPresetError,
   type AgentPreset,
   type AgentPresetDocument,
   type AgentPresetRoster,
@@ -65,7 +64,7 @@ export class SingleOmpPresetRoster extends TypertRemoteService {
 
   async resolve(id?: string): Promise<AgentPreset> {
     if (id === undefined || id === OMP_PRESET.id) return OMP_PRESET;
-    throw new UnknownPresetError(id, [OMP_PRESET.id]);
+    throw new RemoteError("agent-preset/not-found", `agent-presets: preset "${id}" not found (available: omp)`, { agentPreset: id, available: [OMP_PRESET.id] });
   }
 
   async mount(_agentCtx: Context, id?: string): Promise<AgentPreset> {

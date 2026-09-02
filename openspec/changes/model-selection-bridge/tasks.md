@@ -1,6 +1,6 @@
 ## 1. 依赖对齐
 
-- [x] 1.1 将 `apps/omp-webui/package.json` 的 `@deepseek-ai/dsh-*` peerDependencies 从 `0.1.2-alpha.1` 升到 `0.1.2-alpha.3`，运行 `npm install` 并执行 `npm run build`，验证 tsc 编译通过（本地 node_modules 已装 alpha.3）。
+- [x] 1.1 将 `apps/omp-web/package.json` 的 `@deepseek-ai/dsh-*` peerDependencies 从 `0.1.2-alpha.1` 升到 `0.1.2-alpha.3`，运行 `npm install` 并执行 `npm run build`，验证 tsc 编译通过（本地 node_modules 已装 alpha.3）。
 
 ## 2. default model 追踪
 
@@ -17,4 +17,4 @@
 ## 4. 集成验证
 
 - [x] 4.1 起真实 OMP RPC 会话验证：新建会话 `get_state.model` = config `modelRoles.default`（实测 default=deepseek-v4-pro 时 new session 为 deepseek-v4-pro）；`lastRestorableModel` 对 T1/T2/T4 真实 transcript 均返回 kimi（剔除 fallback）。
-- [x] 4.2 运行 `openspec validate model-selection-bridge --strict` 通过，且 `apps/omp-webui` 构建无回归（`npm run build`）。
+- [x] 4.2 运行 `openspec validate model-selection-bridge --strict` 通过，且 `apps/omp-web` 构建无回归（`npm run build`）。

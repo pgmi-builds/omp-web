@@ -1,7 +1,7 @@
-# @pgmi-builds/omp-webui bundle patch. This file is the `dsh.bundle.patch` layer
+# @pgmi-builds/omp-web bundle patch. This file is the `dsh.bundle.patch` layer
 # of the published npm package: when installed via
 #
-#   dsh plugin --profile <name> add @pgmi-builds/omp-webui
+#   dsh plugin --profile <name> add @pgmi-builds/omp-web
 #
 # the profile boot merges THIS patch — mount the OMP provider plus disable the
 # native components OMP replaces — exactly like a manual cordis.patch.yml.
@@ -18,7 +18,7 @@
 # served by an OMP-backed LlmAdapter.
 - insert:
     - id: omp-provider
-      name: '@pgmi-builds/omp-webui'
+      name: '@pgmi-builds/omp-web'
 
 # OMP owns the live agent transcript; disable the built-in loop so it does not
 # double-run alongside the OMP RPC process.

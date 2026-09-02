@@ -1,6 +1,6 @@
 ## 1. 存储基础（store 模块）
 
-- [x] 1.1 新建 `apps/omp-webui/src/store/`：DB 访问接口（open/exec/prepare/run/get/all）+ 运行时检测适配器（Bun→`bun:sqlite` / Node→`node:sqlite`），验证内存库 CRUD 单测通过
+- [x] 1.1 新建 `apps/omp-web/src/store/`：DB 访问接口（open/exec/prepare/run/get/all）+ 运行时检测适配器（Bun→`bun:sqlite` / Node→`node:sqlite`），验证内存库 CRUD 单测通过
 - [x] 1.2 schema 建表：`sessions`（含 UI 字段列）、`workspaces`、`ui_state` + 全部索引，验证启动建表后 `PRAGMA integrity_check` 返回 ok
 - [x] 1.3 查询接口：`list`/`byDshId`/`byOmpId`/`byFile`/`upsert`/`prune` + UI 字段 setter（`setArchived`/`setForkedFrom`/`setPreset`/`touchVisited`/`setWorkspaceOrder`/`getUiState`/`setUiState`），验证每个接口单测覆盖
 - [x] 1.4 DB 生命周期：`OMP_BRIDGE_DB` 路径解析、WAL 模式、`integrity_check`、close，验证路径落在 OMP store 之内时拒绝、非法路径报错

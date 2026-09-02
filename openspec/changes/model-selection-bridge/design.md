@@ -1,6 +1,6 @@
 ## Context
 
-桥接层（`apps/omp-webui`）已把 OMP 会话经 `omp --mode rpc` 桥进 DSH，模型选择信息目前有三处缺口（详见 proposal.md - Why）。上游依赖 `@deepseek-ai/dsh-*` 已升到 `0.1.2-alpha.3`（本地 `apps/omp-webui/node_modules` 已装）。OMP 源码参考 `/tmp/oh-my-pi`（v18.0.11）。
+桥接层（`apps/omp-web`）已把 OMP 会话经 `omp --mode rpc` 桥进 DSH，模型选择信息目前有三处缺口（详见 proposal.md - Why）。上游依赖 `@deepseek-ai/dsh-*` 已升到 `0.1.2-alpha.3`（本地 `apps/omp-web/node_modules` 已装）。OMP 源码参考 `/tmp/oh-my-pi`（v18.0.11）。
 
 关键既有事实：
 - `ctx.agentDefaultModel`（`@deepseek-ai/dsh-agent-default-model`）是「default for new session」的 transport-independent 官方 owner，`currentSelection()` / `saveSelection()`。
@@ -35,7 +35,7 @@
 
 ### D4: peerDependencies 锚定 `0.1.2-alpha.3`
 
-`apps/omp-webui/package.json` 的 `@deepseek-ai/dsh-*` peerDeps 从 `0.1.2-alpha.1` 升到 `0.1.2-alpha.3`，与本地 node_modules 一致。破坏性小（alpha 系列），锚定后避免写码与上游声明漂移。
+`apps/omp-web/package.json` 的 `@deepseek-ai/dsh-*` peerDeps 从 `0.1.2-alpha.1` 升到 `0.1.2-alpha.3`，与本地 node_modules 一致。破坏性小（alpha 系列），锚定后避免写码与上游声明漂移。
 
 ## Risks / Trade-offs
 

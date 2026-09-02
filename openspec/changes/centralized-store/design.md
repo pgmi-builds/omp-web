@@ -91,7 +91,7 @@ CREATE TABLE ui_state (
 ```
 
 - `revision` 不落列，由 `transcript_size` + `last_modified_at` 计算为 `omp:<size>:<mtime>`（延续现有 token 语义）。
-- 查询接口（`apps/omp-webui/src/store/` 导出）：`list()`（默认 `last_modified_at DESC`，manual 模式按 workspace 的 `manual_order`）、`byDshId`、`byOmpId`、`byFile`、`upsert(row)`、`prune(keepFiles)`、`setArchived`、`setForkedFrom`、`setPermissionPreset`、`touchVisited`、`setWorkspaceOrder`、`getUiState` / `setUiState`。
+- 查询接口（`apps/omp-web/src/store/` 导出）：`list()`（默认 `last_modified_at DESC`，manual 模式按 workspace 的 `manual_order`）、`byDshId`、`byOmpId`、`byFile`、`upsert(row)`、`prune(keepFiles)`、`setArchived`、`setForkedFrom`、`setPermissionPreset`、`touchVisited`、`setWorkspaceOrder`、`getUiState` / `setUiState`。
 - 索引对应：UNIQUE `dsh_session_id`（DSH→OMP 翻译，替换 `resolveEntryById` 反向扫描）、UNIQUE `session_file`（file→row）、`cwd`（workspace 归组）、`mtime DESC`（默认排序）、`last_visited_at DESC`（refresh 优先服务）。
 
 ### D5: reconcile 三段式 + 完整元数据提取

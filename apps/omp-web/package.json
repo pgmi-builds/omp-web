@@ -1,7 +1,11 @@
 {
-  "name": "@pgmi-builds/omp-webui",
-  "version": "0.1.2",
-  "description": "OMP provider for DeepSeek Harness (dsh): registers an AgentFactory on ctx.agents that spawns `omp --mode rpc` and bridges OMP's RPC stream into Dash Agent/Session contracts.",
+  "name": "@pgmi-builds/omp-web",
+  "version": "0.2.0",
+  "description": "OMP Web: OMP provider for DeepSeek Harness (dsh) — an AgentFactory that spawns `omp --mode rpc` and bridges OMP's RPC stream into Dash Agent/Session contracts.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pgmi-builds/omp-web.git"
+  },
   "type": "module",
   "main": "dist/index.js",
   "exports": {
@@ -31,20 +35,35 @@
     "@deepseek-ai/dsh-typert-protocol": "0.1.2-alpha.3"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true },
-    "@deepseek-ai/dsh-agent": { "optional": true },
-    "@deepseek-ai/dsh-agent-presets": { "optional": true },
-    "@deepseek-ai/dsh-llm": { "optional": true },
-    "@deepseek-ai/dsh-scope": { "optional": true },
-    "@deepseek-ai/dsh-session": { "optional": true },
-    "@deepseek-ai/dsh-session-persistence": { "optional": true },
-    "@deepseek-ai/dsh-typert-protocol": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-agent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-agent-presets": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-scope": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session-persistence": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-typert-protocol": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
     "typescript": "^5.6.0"
   },
-
   "engines": {
     "node": ">=22.18"
   }

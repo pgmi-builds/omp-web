@@ -199,7 +199,7 @@ setModel(provider: string, modelId: string): Promise<RpcResponse> {
 
 ## 4. 桥接层（dsh-omp-provider）gap
 
-> 源码：`apps/omp-webui/src/agent.ts`（`OmpAgent`）。
+> 源码：`apps/omp-web/src/agent.ts`（`OmpAgent`）。
 
 ### 4.1 模型选择 waterfall —— tier-1 persisted header 永远压过 UI picker
 

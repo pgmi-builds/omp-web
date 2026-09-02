@@ -1,13 +1,13 @@
 ## Why
 
-桥接层（`apps/omp-webui`）对「模型选择」信息向 DSH Web UI 的传递存在三处不准确或缺失，导致 Web UI 无法如实呈现 OMP 会话的模型状态：default 模型未跟踪（new session 无法取到与 OMP TUI 一致的默认模型）、resume 会话的 last used model 在 fallback 后取错（`lastModelCall` 返回 fallback 模型，而 OMP `--resume` 实际恢复 primary）、error 投递入口虽已打通但契约未固化。源码级 + 实测（`docs/plans/omp-model-fallback-mechanism.md`）已确认 OMP 的 fallback 是 config 静态能力、桥接层无法经 RPC 复刻，正确策略是「诚实透明传递」而非「复刻 fallback」。锚定上游 DSH `0.1.2-alpha.3`。
+桥接层（`apps/omp-web`）对「模型选择」信息向 DSH Web UI 的传递存在三处不准确或缺失，导致 Web UI 无法如实呈现 OMP 会话的模型状态：default 模型未跟踪（new session 无法取到与 OMP TUI 一致的默认模型）、resume 会话的 last used model 在 fallback 后取错（`lastModelCall` 返回 fallback 模型，而 OMP `--resume` 实际恢复 primary）、error 投递入口虽已打通但契约未固化。源码级 + 实测（`docs/plans/omp-model-fallback-mechanism.md`）已确认 OMP 的 fallback 是 config 静态能力、桥接层无法经 RPC 复刻，正确策略是「诚实透明传递」而非「复刻 fallback」。锚定上游 DSH `0.1.2-alpha.3`。
 
 ## What Changes
 
 - **default_model 追踪**：新增 store 字段跟踪 `~/.omp/agent/config.yml` 的 `modelRoles.default`，按桥接层既有 persistent-storage 扫描节奏更新，同步到 `ctx.agentDefaultModel.saveSelection()`；Web UI 经 `currentSelection()` 读取，作为 new session 的默认模型（与 OMP TUI 的「default for new session」语义一致）。
 - **last_used_model_id 修正**：`lastModelCall` 改为 `lastRestorableModel`——从 transcript 的 `model_change` entries 提取最后一个非 `role:"fallback"`（非 EPHEMERAL）的模型，而非「最后一个 assistant message 的 model」。修正 `reconcile.ts`（store 填充）与 `replay.ts`（`request/header`）两处消费点，使 Web UI 呈现的「next prompt 模型」= OMP `--resume` 实际恢复的模型。
 - **error 投递契约固化**：确认并固化 `turn/end` reason 为 per-turn error 投递入口——`ompFailure` 把 OMP `stopReason:"error"` 分类为 `AUTH`/`RATE_LIMIT`/`QUOTA`/`SERVER`/`UNKNOWN`。桥接层不参与 DSH 原生 `llm-retry`/`llm-fallbacks`（那是原生 AgentLoop 的 step 级机制；桥接层经 RPC 只能观测 per-turn 颗粒度，无法侵入式干预 OMP 运行时）。
-- **依赖升级**：`apps/omp-webui/package.json` peerDependencies 从 `0.1.2-alpha.1` 升至 `0.1.2-alpha.3`（本地 node_modules 已装 alpha.3）。
+- **依赖升级**：`apps/omp-web/package.json` peerDependencies 从 `0.1.2-alpha.1` 升至 `0.1.2-alpha.3`（本地 node_modules 已装 alpha.3）。
 
 ## Capabilities
 

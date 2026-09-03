@@ -90,3 +90,15 @@ npm publish --access public --cache ~/workspaces/dsh-omp/.scratch/npm-cache
 - `master` 与 origin 同步；发布走 git tag（`v0.0.2`…`v0.2.0`）。
 - Untracked/遗留: `Caddyfile.opengate`、`.dsh_better_edit/`（编辑工具产物，.gitignore 候选）；`docs/upstream-dsh-0.1.2-alpha.5-report.md`、`docs/upstream-dsh-community-survey.md`（2026-09-02/03 上游调研产物——alpha.3→alpha.5 改进报告 + 社区生态调研，核心结论：市场 1000 条目中零 OMP 桥接、omp-web 独一份；harness 升级决策的前置材料，未入库）；`~/.config/systemd/user/dsh-omp.service.d` 孤儿 drop-in（unit 已不存在，无害，可清理）；`omp-web-test` profile 已从盘上移除（按需重建）；profile `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 里残留一条 `@pgmi-builds/omp-webui@0.1.2`（无害）。
 - 版本线: v0.0.3 删集中化 omp-sessions.json → v0.1.0 收敛为 `apps/` 布局 + session supervisor → v0.1.1 以 SQLite（bridge-store.sqlite）重新引入集中 index、废弃 mobile/in-dsh apps（→ `archived/`）→ v0.1.2 registry 分发 + model-selection bridge → **v0.2.0 rebrand omp-web**。
+
+---
+
+## 四、dsh 插件开发面速查（host 半）— 2026-09-03 自 dashr 蒸馏
+
+机制层完整知识库在 dashr 仓（姊妹项目、同一插件模型）：`~/workspaces/dashr/.agents/skills/dsh-plugin-development`（core-framework / web-ui 两分量，源码锚点 @ dsh-v0.1.2-alpha.5）与 `~/workspaces/dashr/.agents/skills/upstream-alignment`（对齐轮流程）。只留对本仓——host 半、无 client 半的 OMP wrapper 插件——load-bearing 的裁决：
+
+- **patch 行模型**：行 schema `{id, name, config, inject, disabled, group}`；层序 = bundles（列序）→ profile patch → home patch → `--patch`，后层按 id **整行重述**（全键重写，非 merge），用户层恒胜。改 `name` 触发重新 import——整插件替换的正规入口 = patch 行 id 覆盖 + `name` 重指。`!!js` 表达式 boot 期求值，可读 `process.env` 与 loader 上下文服务（先例 `trustedHosts: !!js ctx.webRuntime.trustedHosts`）。
+- **硬边界（组合面 fail-loud，无 last-wins）**：同 scope 重复 `ctx.provide` = 加载期硬错；**兄弟插件之间不存在 service 遮蔽**（closest-wins 仅沿 fiber.parent 祖先链，跨 isolate 即停）；同名包遮蔽原生模块也不可行。omp-web 替换原生行为的唯一正道 = patch `disabled` + 自供（现状即此），不能同名 provide 抢注。
+- **host 半范式**：`apply(ctx)` + `inject` 声明式依赖（服务到位才加载、服务替换自动重跑）；HTTP 面 `ctx.webServer.register({kind:'prefix', path, handler})`；config schema 用 schemastery（default 即文档）。**fail-open 不阻断宿主**：对 omp 二进制/外部态的探测与供给失败要优雅降级，勿让宿主 dsh 起不来（dashr kernel 三级供给是范本）。
+- **浏览器侧信任缺口（omp-web 待验证风险）**：原生 ui-settings 的 describe mirror 在非 loopback 页面 = memory = terminally unavailable（"settings are unavailable in this browser"，Settings/Models 页瘫；上游设计笔记定性为实现产物而非设计决策）。`omp.pc.randomhash.app` 页面权威非 loopback，而 omp-web **无 client 半**、无 ownsHost 补偿——dashr 的 B 机制 = host 半监听 `webserver/index-inject` push head 内联脚本设 `window.__DSH_TRANSPORT__={ownsHost:true}`（head 先于一切 bundle，无时序竞争；ownsHost 属 off-label，对齐轮盯其消费点）。域名上若需 Settings/Models 页需评估补 client 半；loopback 直连 127.0.0.1:3081 不受影响。
+- **上游对齐轮（harness 新 tag 时）**：照 dashr `upstream-alignment` 流程跑——S1 先查 patch 载体文件（`package.json`/`pnpm-workspace.yaml`）tag 间 diff + 插件引用的 `@deepseek-ai/*` 名在新 tag 包集合是否齐全；S2 备份 → stash → checkout → pop 重放本地 patch（本仓 upstream/dsh 的 storeDir patch 仍欠，见 §二）；S4 `set -o pipefail`、install/build 错误读全文勿只看尾部；S6/7 用 §二 systemd-run 配方拉 4999 + 冒烟（`--dump-config`、鉴权 curl、fence 401/403 分野）；差异报告落 `docs/upstream-dsh-<version>-report.md`（alpha.5 报告已在 docs/，untracked），实测报告 `-local-test-report.md`；发现 → 下一波 openspec change，坑/约定回写本文件。

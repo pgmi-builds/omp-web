@@ -33,8 +33,9 @@
 ### Profile（`~/.omp/omp-web/profiles/omp-web`）
 
 - `package.json`: deps `@pgmi-builds/omp-web 0.2.0`（精确锁）+ `dsh-better-sidebar 0.18.0-alpha.0`；`dsh.profile.bundles` = `["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@pgmi-builds/omp-web", "dsh-better-sidebar"]`。
-- profile 自带 `pnpm-workspace.yaml`: `nodeLinker: hoisted`、`autoInstallPeers: false`（永不在 profile 树里嵌 `@deepseek-ai` 副本）、`minimumReleaseAgeExclude`（pnpm 11.7 供应链年龄门——新发布的包需进 exclude 才可装，`pnpm add` 会自动追加）。
+- profile 自带 `pnpm-workspace.yaml`: `nodeLinker: hoisted`、`autoInstallPeers: false`（永不在 profile 树里嵌 `@deepseek-ai` 副本）、`minimumReleaseAgeExclude`（pnpm 11.7 供应链年龄门——新发布的包需进 exclude 才可装，`pnpm add` 会自动追加）。**勿信 `@latest`**：刚发布版本会被年龄门静默挡回旧豁免版并覆盖部署位（dashr 实证 0.2.1-d←0.2.1-a），升级一律精确版本 add。
 - **registry distribution（v0.1.2 起）**：pnpm-lock 以 npm registry integrity 锁定。部署/升级流：bump 版本 → `npm publish`（在 `apps/omp-web`，见下）→ profile 目录 `pnpm add @pgmi-builds/omp-web@<ver>` → 重启 unit。
+- **生产部署原则（2026-09-02 裁决，与 dashr 同款）：user, just another user**——prod 只从 registry 精确版本安装，不做源码级/手工同步侵入；`file:` 依赖与手工同步仅限未发布的本地迭代，且只落 §二 test profile。dev/test 与 prod 两条线据此分离。
 - `cordis.yml` 为空 `[]`；树按层组成：各 bundle patch（omp-web 包内 patch 负责 mount + 禁原生组件）→ 用户层 `cordis.patch.yml` 只放 profile 特有值：`settings.path` 指向 profile 内 `settings.yaml`、`webserver.port=3081`（端口来自这里，不在 unit 里）。`agent-default-model` 动态落在 settings.yaml（当前 deepseek/deepseek-v4-flash）。
 
 ### 依赖解析 — 两层，不是一棵树
@@ -62,6 +63,12 @@
 - 测完: **把 4999 runtime 关停**；Caddy 不动。（当前 4999 无监听，test 实例未在跑。）
 - 免 harness 的单元回路: `cd apps/omp-web && npm run build && node --test test/*.test.mjs`（node:test 套件 import `../dist`；注意本机 Node 22.22.1 下 `node --test test/` 会被当作模块路径，必须用 glob）。vendored types 使 tsc 无需 dsh checkout。
 
+### 拉起 / 关停（sandbox-safe，2026-09-03 dashr 实证移植）
+
+- **勿从 agent 沙箱化 bash 直接拉 daemon**：沙箱内启动的进程继承嵌套沙箱，bwrap 探测失败（`No permissions to create a new namespace`）→ `SANDBOX_UNAVAILABLE`。用 `systemd-run --user` 在沙箱外启动（沙箱内连 user bus 会被拒，单命令 `danger-full-access` 升级）；配方照 dashr 同款：`WorkingDirectory`=upstream checkout、`Environment=DSH_HOME=~/.omp/omp-web`+`OMP_HOME=~/.omp`、日志 append 到 `.scratch/omp-web-4999.log`、unit 名 `omp-web-4999-test`。ExecStart 形态 = prod unit（§一）换 `--profile omp-web-test`；4999 端口沿用 prod 机制（test profile patch 的 `webserver.port`，或 dashr 实测可用的 CLI `--port 4999`），profile 重建时定稿并回填本节。
+- token 每次启动轮换：从日志取 `?token=…` URL；curl 冒烟需 cookie jar：`curl -c jar -L '<token-url>'`（303 重定向靠 cookie 保认证）。
+- 关停：`systemctl --user stop omp-web-4999-test`（勿用 kill）；Caddy 不动。
+
 ### npm 发布（从本机）
 
 ```bash
@@ -76,10 +83,10 @@ npm publish --access public --cache ~/workspaces/dsh-omp/.scratch/npm-cache
 
 ---
 
-## 三、Repo 状态与风险（2026-09-02 快照，v0.2.0 rebrand 后）
+## 三、Repo 状态与风险（2026-09-03 快照，v0.2.0 rebrand 后）
 
 - **v0.2.0 rebrand 已全链路落地（2026-09-02）**: `omp-webui` → `omp-web` 统一品牌——GitHub repo 改名（旧 URL 重定向）、npm `@pgmi-builds/omp-web@0.2.0` 发布、prod profile 切换（lock integrity = 发布 tarball shasum）、`omp-web.service` 重启验证（active、3081 应答、bridge-store 正常打开）。v0.1.2 时代的未提交漂移（`RemoteError` preset fix）已随本次提交收敛入库。
 - 旧的 `@pgmi-builds/omp-webui` npm 包保留在 registry（最后 0.1.2），不 unpublish、不再维护；无外部用户依赖（用户确认）。
 - `master` 与 origin 同步；发布走 git tag（`v0.0.2`…`v0.2.0`）。
-- Untracked/遗留: `Caddyfile.opengate`、`.dsh_better_edit/`（编辑工具产物，.gitignore 候选）；`~/.config/systemd/user/dsh-omp.service.d` 孤儿 drop-in（unit 已不存在，无害，可清理）；`omp-web-test` profile 已从盘上移除（按需重建）；profile `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 里残留一条 `@pgmi-builds/omp-webui@0.1.2`（无害）。
+- Untracked/遗留: `Caddyfile.opengate`、`.dsh_better_edit/`（编辑工具产物，.gitignore 候选）；`docs/upstream-dsh-0.1.2-alpha.5-report.md`、`docs/upstream-dsh-community-survey.md`（2026-09-02/03 上游调研产物——alpha.3→alpha.5 改进报告 + 社区生态调研，核心结论：市场 1000 条目中零 OMP 桥接、omp-web 独一份；harness 升级决策的前置材料，未入库）；`~/.config/systemd/user/dsh-omp.service.d` 孤儿 drop-in（unit 已不存在，无害，可清理）；`omp-web-test` profile 已从盘上移除（按需重建）；profile `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 里残留一条 `@pgmi-builds/omp-webui@0.1.2`（无害）。
 - 版本线: v0.0.3 删集中化 omp-sessions.json → v0.1.0 收敛为 `apps/` 布局 + session supervisor → v0.1.1 以 SQLite（bridge-store.sqlite）重新引入集中 index、废弃 mobile/in-dsh apps（→ `archived/`）→ v0.1.2 registry 分发 + model-selection bridge → **v0.2.0 rebrand omp-web**。

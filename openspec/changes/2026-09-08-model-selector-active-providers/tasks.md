@@ -10,5 +10,5 @@
 ## 2. 验证与收尾
 
 - [x] T5 4999 实测（2026-09-09）：`session/modelCatalog` = 5 provider（deepseek 3 / bailian 5 / zai-plan 4 / kimi-plan 1 / xai 37），defaultSelection=zai-plan/glm-5.3-flash。另：本 change 实现扩展为 **CLI 模式模型功能闭环**——新增 `src/omp-cli.ts`（models --json / config get·set modelRoles），`src/index.ts` 双向 default 同步 tick（OMP↔DSH shadow key 差分，防回环）。**xai 模型实际发起一轮对话验证凭据链待做**
-- [ ] T6 prod 3081 随 0.3.0 升级窗口验证（daemon 上下文 cwd/OMP_HOME 满足子进程写库前提）
+- [x] T6 prod 3081 已升级 0.2.0-b（2026-09-09，提前于 0.3.0）：age-gate exclude 补 @0.2.0-b 后精确 add + 重启；modelCatalog 5 provider 实测 ✓，双向 default 同步上线 prod。教训落档：**升级必须先补 minimumReleaseAgeExclude 再精确 add**——0.2.0-b 被年龄门挡回 0.2.0 时，恰逢 4999（0.2.0-b）已把共享 workspace 状态写成 v2 形状，旧 0.2.0 的 v1 persistence 读新状态 = indexHeader undefined.id 崩溃循环（域内 502）
 - [ ] T7 上游帧限跟进记录：`get_available_models` 超 1 MiB 的上游 issue/旋钮线索（若解除，可评估 RPC 直读替代子进程）

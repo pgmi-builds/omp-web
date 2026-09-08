@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { OmpSdkSidecar } from "../dist/index.js";
+import { OmpSdkSidecar } from "../dist/sidecar-client.js";
 
 test("sidecar skeleton roundtrip", async (t) => {
   const sidecar = new OmpSdkSidecar({ ompHome: "/home/u1/.omp" });
@@ -19,14 +19,15 @@ test("sidecar skeleton roundtrip", async (t) => {
   console.log("models:", models.models.length, "providers:", models.providers.join(","));
 
   const created = await sidecar.call("session.create", { persistence: "memory" });
+  assert.ok(created.handle);
   assert.ok(created.sessionId);
 
-  const info = await sidecar.call("session.info", { sessionId: created.sessionId });
+  const info = await sidecar.call("session.state", { handle: created.handle });
   assert.equal(info.sessionId, created.sessionId);
   assert.equal(info.isStreaming, false);
   assert.equal(info.messageCount, 0);
 
-  const disposed = await sidecar.call("session.dispose", { sessionId: created.sessionId });
+  const disposed = await sidecar.call("session.dispose", { handle: created.handle });
   assert.equal(disposed.disposed, true);
 
   const listed = await sidecar.call("sessions.list", { all: true });

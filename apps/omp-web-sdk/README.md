@@ -36,3 +36,18 @@ dsh 宿主 (Node 22, 本包 dist/)            Bun sidecar (本包 sidecar/)
 - `src/sidecar-client.ts`：Node 侧 spawn/关联/事件分发/优雅关停；`src/index.ts` 暂导出 client。
 - 冒烟 `test/sidecar-smoke.test.mjs`：ready 0.9s，全链路（ping→50 模型→session create/info/dispose→sessions.list）2.4s，`npm test` 1.8s 绿。
 - 坑已修：`ModelRegistry.refreshInBackground()` 此版本返回 void（非 Promise），可选链后接 `.catch` 会炸；ready-timeout 定时器必须 clear 否则 Node 进程挂 60s。
+
+## As-built：衔接层移植（2026-09-09，已完成 ✅）
+
+- `src/rpc-types.ts`：从 omp-web `rpc.ts` 提取的 OMP wire 类型（verbatim），两条线共用同一载荷形状。
+- `src/sdk-client.ts`：**`OmpSdkClient`——与 `OmpRpcClient` 同公共面**（on/onFailure/sendRaw/send/getState/getMessages/getSessionStats/getSubagents/prompt/followUp/steer/setModel/abort/newSession/close），底层复用单个共享 sidecar（模块级单例 + 引用计数，refcount 归零自动关停）。spawn args 解析 `--approval-mode`（yolo→autoApprove）与 `--resume`；未知 flag fail-loud。
+- 衔接层整体移植（与 omp-web 逐字节同源，仅换接缝）：`agent.ts` `adapter.ts` `index.ts` `models.ts` `knobs.ts` `pairing.ts` `permission.ts` `replay.ts` `session-persistence-omp.ts` `supervisor.ts` `omp-store.ts` `agent-preset-omp.ts` `omp-cli.ts` `store/`。
+- sidecar 升级：session handle 化（`newSession` 换 OMP session id 但 handle 稳定）；补齐 `session.state/messages/stats/subagents/setModel/new`；`getSessionStats` 实测返回 contextUsage（contextWindow 1000000）。
+- 测试：omp-web 单测四件（content-detection/omp-store/replay/store）+ sidecar 冒烟 + sdk-client 集成 = **20/20 绿，3.6s**；tsc 0 错。
+- 本地 dev fixture：`node_modules/@deepseek-ai/*` symlink 至真实 dsh 安装（照 omp-web 惯例，node_modules 不入库）。
+
+### 已知差异（SDK 线 vs RPC 线，待办）
+
+- `extension_ui_response`（审批卡应答）在 SDK 线暂为 no-op：SDK 侧审批走 `autoApprove`/approval 事件，卡片化审批的等价通道待接。
+- `getSubagents` 暂返回 `[]`（SDK 的 subagent registry 暴露面待查）。
+- 未跑 4999 全链路（dsh 宿主内 provider 挂载）——下一步。

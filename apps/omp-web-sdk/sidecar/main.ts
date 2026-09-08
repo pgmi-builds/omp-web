@@ -4,20 +4,21 @@
  *   OMP_HOME=~/.omp bun run sidecar/main.ts
  *
  * Wraps @oh-my-pi/pi-coding-agent and speaks the v0 JSON-lines protocol
- * defined in ./protocol.ts. One sidecar = one OMP "app instance":
+ * defined in ../src/protocol.ts. One sidecar = one OMP "app instance":
  * shared authStorage / modelRegistry across all sessions it hosts.
+ *
+ * Sessions are addressed by a sidecar-minted `handle` (h1, h2, ...) rather
+ * than the OMP session id, because AgentSession-level operations
+ * (newSession / switchSession / fork) mint a NEW OMP session id while the
+ * bridge-side handle must stay stable for the lifetime of the client.
  */
-import { createAgentSession, SessionManager, discoverAuthStorage, ModelRegistry, Settings } from "@oh-my-pi/pi-coding-agent";
+import { createAgentSession, SessionManager, discoverAuthStorage, ModelRegistry } from "@oh-my-pi/pi-coding-agent";
 import { PROTOCOL_VERSION, type EventFrame, type RequestFrame, type ResponseFrame } from "../src/protocol.ts";
 
 // ---------- outbound ----------
 
 function send(frame: ResponseFrame | EventFrame): void {
   process.stdout.write(JSON.stringify(frame) + "\n");
-}
-
-function emitEvent(event: string, payload: unknown, sessionId?: string): void {
-  send({ event, payload, ...(sessionId ? { sessionId } : {}) });
 }
 
 // ---------- shared app-level state (A-lane) ----------
@@ -27,7 +28,6 @@ const PKG_VERSION: string = piPkg?.default?.version ?? piPkg?.version ?? "unknow
 
 const authStorage = await discoverAuthStorage();
 const modelRegistry = new ModelRegistry(authStorage);
-// kick off background refresh; models.list(refresh:true) can force a fresh one
 void (modelRegistry as any).refreshInBackground?.()?.catch?.(() => {});
 
 interface HeldSession {
@@ -35,14 +35,58 @@ interface HeldSession {
   unsubscribe: () => void;
 }
 const sessions = new Map<string, HeldSession>();
+let nextHandle = 0;
 
-function hold(sessionId: string, held: HeldSession) {
-  sessions.set(sessionId, held);
+function hold(session: HeldSession["session"]): string {
+  const handle = `h${++nextHandle}`;
+  const unsubscribe = session.subscribe((event: any) => {
+    send({ event: "session:event", sessionId: handle, payload: event });
+  });
+  sessions.set(handle, { session, unsubscribe });
+  return handle;
 }
-async function get(sessionId: string) {
-  const held = sessions.get(sessionId);
-  if (!held) throw new Error(`unknown sessionId: ${sessionId}`);
+
+async function get(handle: string) {
+  const held = sessions.get(handle);
+  if (!held) throw new Error(`unknown session handle: ${handle}`);
   return held.session;
+}
+
+function drop(handle: string): HeldSession | undefined {
+  const held = sessions.get(handle);
+  if (held) sessions.delete(handle);
+  return held;
+}
+
+async function createSession(params: any): Promise<string> {
+  const opts: Record<string, unknown> = {};
+  if (params?.cwd) opts.cwd = params.cwd;
+  if (params?.model) {
+    const found = modelRegistry.find?.(params.model);
+    if (found) opts.model = found;
+  }
+  if (params?.systemPrompt !== undefined) opts.systemPrompt = params.systemPrompt;
+  if (params?.appendSystemPrompt !== undefined) opts.appendSystemPrompt = params.appendSystemPrompt;
+  // approval parity with `omp --approval-mode`: yolo = fully auto-approved.
+  if (params?.approvalMode === "yolo") opts.autoApprove = true;
+  if (params?.resumeFile) opts.sessionManager = SessionManager.open(params.resumeFile);
+  else if (params?.persistence === "file") opts.sessionManager = SessionManager.create(params.cwd ?? process.cwd());
+  else opts.sessionManager = SessionManager.inMemory();
+
+  const { session } = await createAgentSession(opts as any);
+  return hold(session);
+}
+
+function describe(session: HeldSession["session"]) {
+  const model: any = session.model;
+  return {
+    sessionId: session.sessionId,
+    sessionFile: session.sessionFile ?? undefined,
+    model: model ? { id: model.id, provider: model.provider, name: model.name } : undefined,
+    thinkingLevel: String(session.thinkingLevel),
+    isStreaming: session.isStreaming,
+    messageCount: session.messages.length,
+  };
 }
 
 // ---------- method implementations ----------
@@ -50,11 +94,7 @@ async function get(sessionId: string) {
 type Handler = (params: any) => Promise<unknown>;
 
 const table: Record<string, Handler> = {
-  "sys.ping": async () => ({
-    pong: true,
-    sdk: PKG_VERSION,
-    bun: Bun.version,
-  }),
+  "sys.ping": async () => ({ pong: true, sdk: PKG_VERSION, bun: Bun.version }),
 
   "models.list": async ({ refresh }: { refresh?: boolean }) => {
     if (refresh) await modelRegistry.refresh();
@@ -70,79 +110,91 @@ const table: Record<string, Handler> = {
     };
   },
 
-  "settings.get": async ({ key }: { key?: string }) => {
-    // effective merged settings via the discovered Settings instance
-    const settings = await Settings.init();
-    const value = key ? settings.get?.(key) : undefined;
-    return { value: value ?? null };
+  "session.create": async (params) => {
+    const handle = await createSession(params);
+    return { handle, ...describe(await get(handle)) };
   },
 
-  "session.create": async ({ persistence = "memory", cwd, model, systemPrompt, appendSystemPrompt }: any) => {
-    const sessionManager =
-      persistence === "file" ? SessionManager.create(cwd ?? process.cwd()) : SessionManager.inMemory();
-    const { session } = await createAgentSession({
-      sessionManager,
-      ...(model ? { model: modelRegistry.find?.(model) ?? (model as any) } : {}),
-      ...(systemPrompt !== undefined ? { systemPrompt } : {}),
-      ...(appendSystemPrompt !== undefined ? { appendSystemPrompt } : {}),
-    });
-    const unsubscribe = session.subscribe((event: any) => {
-      send({ event: "session:event", sessionId: session.sessionId, payload: event });
-    });
-    hold(session.sessionId, { session, unsubscribe });
-    return {
-      sessionId: session.sessionId,
-      sessionFile: session.sessionFile ?? undefined,
-      model: session.model ? `${(session.model as any).provider}/${(session.model as any).id}` : undefined,
-    };
-  },
-
-  "session.dispose": async ({ sessionId }: any) => {
-    const held = sessions.get(sessionId);
+  "session.dispose": async ({ handle }: any) => {
+    const held = drop(handle);
     if (!held) return { disposed: true };
-    sessions.delete(sessionId);
     held.unsubscribe();
     await held.session.dispose();
     return { disposed: true };
   },
 
-  "session.info": async ({ sessionId }: any) => {
-    const session = await get(sessionId);
-    return {
-      sessionId: session.sessionId,
-      sessionFile: session.sessionFile ?? undefined,
-      model: session.model ? `${(session.model as any).provider}/${(session.model as any).id}` : undefined,
-      thinkingLevel: String(session.thinkingLevel),
-      isStreaming: session.isStreaming,
-      messageCount: session.messages.length,
-      systemPromptBytes: (session.systemPrompt ?? "").length,
-    };
+  // get_state parity
+  "session.state": async ({ handle }: any) => describe(await get(handle)),
+
+  // get_messages parity
+  "session.messages": async ({ handle }: any) => {
+    const session = await get(handle);
+    return { messages: session.messages };
   },
 
-  "session.prompt": async ({ sessionId, text, streamingBehavior }: any) => {
-    const session = await get(sessionId);
-    // fire-and-resolve-on-settle: prompt() awaits the full turn; the host sees
-    // streaming through session:event frames in the meantime.
-    void session.prompt(text, streamingBehavior ? { streamingBehavior } : undefined);
+  // get_session_stats parity (live sessions)
+  "session.stats": async ({ handle }: any) => {
+    const session: any = await get(handle);
+    try {
+      return (await session.getSessionStats?.()) ?? {};
+    } catch {
+      return {};
+    }
+  },
+
+  // get_subagents parity — SDK subagent registry exposure TBD; fail-soft.
+  "session.subagents": async () => ({ subagents: [] }),
+
+  "session.prompt": async ({ handle, text, streamingBehavior }: any) => {
+    const session = await get(handle);
+    // Fire-and-forget, mirroring RPC's prompt semantics: the response reports
+    // acceptance only; the turn itself streams through session:event frames.
+    // Turn-level failures arrive as events (`message_update` error / notice).
+    void Promise.resolve(
+      session.prompt(text, streamingBehavior ? { streamingBehavior } : undefined),
+    ).catch(() => {});
     return { accepted: true };
   },
 
-  "session.steer": async ({ sessionId, text }: any) => {
-    const session = await get(sessionId);
+  "session.steer": async ({ handle, text }: any) => {
+    const session = await get(handle);
     await session.steer(text);
     return { accepted: true };
   },
 
-  "session.followUp": async ({ sessionId, text }: any) => {
-    const session = await get(sessionId);
+  "session.followUp": async ({ handle, text }: any) => {
+    const session = await get(handle);
     await session.followUp(text);
     return { accepted: true };
   },
 
-  "session.abort": async ({ sessionId }: any) => {
-    const session = await get(sessionId);
+  "session.abort": async ({ handle }: any) => {
+    const session = await get(handle);
     await session.abort();
     return { accepted: true };
+  },
+
+  "session.setModel": async ({ handle, provider, modelId }: any) => {
+    const session = await get(handle);
+    const all = modelRegistry.getAvailable();
+    const target = all.find((m: any) => m.provider === provider && m.id === modelId);
+    if (!target) throw new Error(`model not available: ${provider}/${modelId}`);
+    await session.setModel(target as any);
+    return { accepted: true };
+  },
+
+  // new_session parity: replace the held AgentSession with a fresh one under
+  // the same handle. The old session is disposed after the swap.
+  "session.new": async ({ handle, cwd }: any) => {
+    const held = sessions.get(handle);
+    if (!held) throw new Error(`unknown session handle: ${handle}`);
+    const fresh = await createSession({ cwd: cwd ?? (held.session as any).cwd ?? process.cwd(), persistence: "file" });
+    // hold() minted a new handle for the fresh session; steal its entry.
+    const freshHeld = drop(fresh)!;
+    held.unsubscribe();
+    sessions.set(handle, freshHeld);
+    try { await held.session.dispose(); } catch {}
+    return describe(freshHeld.session);
   },
 
   "sessions.list": async ({ cwd, all }: any) => {
@@ -196,12 +248,11 @@ async function handleRaw(raw: string): Promise<void> {
       send({ id: frame.id, ok: false, error: String(err?.message ?? err) });
     }
   }
-  // notifications (no id) are accepted but have no handlers yet
 }
 
 process.stdin.on("end", () => {
   void (async () => {
-    for (const [id, held] of sessions) {
+    for (const [, held] of sessions) {
       try {
         held.unsubscribe();
         await held.session.dispose();
@@ -211,8 +262,4 @@ process.stdin.on("end", () => {
   })();
 });
 
-emitEvent("ready", {
-  protocol: PROTOCOL_VERSION,
-  sdk: "see sys.ping",
-  sessions: 0,
-});
+send({ event: "ready", payload: { protocol: PROTOCOL_VERSION, sdk: PKG_VERSION, sessions: 0 } });

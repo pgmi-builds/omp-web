@@ -22,6 +22,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type {
   Agent,
+  AssistantStreamFrame,
   AgentOptions,
   AgentStatus,
   CancelOptions,
@@ -31,12 +32,13 @@ import { Inbox, agentEvents, type AgentEventDispatch } from "@deepseek-ai/dsh-ag
 import type {
   AgentCancelCause,
   Session,
+  SessionSeq,
   SessionId,
   TurnEndReason,
   UserMessage,
 } from "@deepseek-ai/dsh-session";
-import type { AssistantMessage, ContentBlock, StreamChunk, TokenUsage } from "@deepseek-ai/dsh-llm";
-import { ToolCallId, QUOTA_EXCEEDED_CODE, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import type { AssistantMessage, AssistantStreamRecord, ContentBlock, StreamChunk, TokenUsage } from "@deepseek-ai/dsh-llm";
+import { LlmAttemptId, ToolCallId, QUOTA_EXCEEDED_CODE, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { createScope, type Scope } from "@deepseek-ai/dsh-scope";
 import type { ApprovalOutcome, ApprovalService } from "@deepseek-ai/dsh-user-approval";
 import type { OmpAssistantMessageEvent, OmpContentBlock, OmpMessage, OmpRpcClient, RpcEvent } from "./rpc.js";
@@ -45,6 +47,58 @@ import type { OmpAssistantMessageEvent, OmpContentBlock, OmpMessage, OmpRpcClien
 import type {} from "@deepseek-ai/dsh-commands";
 import { supervisor } from "./supervisor.js";
 import { getBridgeStore } from "./store/index.js";
+
+/**
+ * v2 live assistant-stream publication for the OMP bridge — the same frame
+ * protocol the reference loop's AssistantStreamAttempt speaks (start marker,
+ * dense zero-based chunks, terminal settlement) emitted over this agent's own
+ * dispatch, so the session-controller folds OMP's stream into its reconnect
+ * baseline. Chunks also accumulate as raw durable records embedded in the
+ * final assistant/message.
+ */
+class AssistantStreamBridge {
+  readonly attemptId: LlmAttemptId;
+  readonly records: AssistantStreamRecord[] = [];
+  #nextRevision: () => number;
+  #emit: (frame: AssistantStreamFrame) => void;
+  #index = 0;
+  #terminal = false;
+
+  constructor(sessionId: SessionId, attempt: number, nextRevision: () => number, emit: (frame: AssistantStreamFrame) => void) {
+    this.attemptId = LlmAttemptId(`${sessionId}:${attempt}`);
+    this.#nextRevision = nextRevision;
+    this.#emit = emit;
+  }
+
+  /** Whether the terminal frame already fired. */
+  get ended(): boolean {
+    return this.#terminal;
+  }
+
+  /** Opening marker before the first delivered chunk. */
+  start(turn: number, step: number): void {
+    this.#emit({ type: "start", attemptId: this.attemptId, revision: this.#nextRevision(), turn, step });
+  }
+
+  /** One live chunk: durable record plus dense process-local frame. */
+  push(chunk: StreamChunk): void {
+    const time = Date.now();
+    this.records.push({ type: "chunk", time, chunk });
+    this.#emit({ type: "chunk", attemptId: this.attemptId, revision: this.#nextRevision(), index: this.#index++, time, chunk });
+  }
+
+  /** Terminal settlement after the durable assistant/message committed. */
+  settle(seq: SessionSeq): void {
+    this.#terminal = true;
+    this.#emit({ type: "end", attemptId: this.attemptId, revision: this.#nextRevision(), index: this.#index, outcome: { kind: "committed", eventType: "assistant/message", seq } });
+  }
+
+  /** No durable attempt event will commit. */
+  abandon(): void {
+    this.#terminal = true;
+    this.#emit({ type: "end", attemptId: this.attemptId, revision: this.#nextRevision(), index: this.#index, outcome: { kind: "abandoned" } });
+  }
+}
 
 /** Diagnostic trace (set OMP_TRACE=1 on the dsh process to enable). */
 const TRACE = process.env.OMP_TRACE === "1";
@@ -269,7 +323,10 @@ export class OmpAgent implements Agent {
   #cancelCause: AgentCancelCause | null = null;
   /** Terminal model failure of the open turn (`message_end` stopReason "error"); consumed by `agent_end`. */
   #pendingFailure: { message: string; code: string } | null = null;
-  #chunkSeqs: number[] = [];
+  /** Live v2 assistant-stream publication for the in-flight OMP message. */
+  #streamBridge: AssistantStreamBridge | undefined;
+  #assistantAttemptCounter = 0;
+  #assistantStreamRevision = 0;
 
   /** The current turn's user/message was appended locally and OMP's echo is still awaited. */
   #localUserPending = false;
@@ -310,13 +367,13 @@ export class OmpAgent implements Agent {
     });
     this.#scope = createScope(loopCtx, this);
     this.ctx = this.#scope.ctx.extend({ agent: this });
-    this.#lastTurn = session.events.findLast((event) => event.type === "turn/start")?.data.turn ?? 0;
+    this.#lastTurn = session.snapshotEvents().findLast((event) => event.type === "turn/start")?.data.turn ?? 0;
     rpc.on((event) => this.#handleEvent(event));
     rpc.onFailure((error) => this.#fail(error));
     // OMP is single-mode: stamp the live session's preset so the chat-header
     // badge resolves it from events even for a scan-native session resumed
     // under a header that predates the roster. Idempotent — skip when present.
-    if (!session.events.some((event) => event.type === "agent-preset/selected" && event.data?.agentPreset === "omp")) {
+    if (!session.snapshotEvents().some((event) => event.type === "agent-preset/selected" && event.data?.agentPreset === "omp")) {
       session.append("agent-preset/selected", { agentPreset: "omp" });
     }
     // `/permission` cannot work here: OMP pins `--approval-mode` at launch and
@@ -699,6 +756,7 @@ export class OmpAgent implements Agent {
   }
 
   #fail(error: unknown): void {
+    this.#abandonStreamBridge();
     if (this.#disposed) return;
     trace(`#fail ${String(error).slice(0, 200)}`);
     this.#closeTurn({ kind: "error", error: { message: String(error), code: "UNKNOWN" } });
@@ -733,7 +791,7 @@ export class OmpAgent implements Agent {
           }
         } else if (message?.role === "assistant") {
           // Reset per-message streaming accumulators.
-          this.#chunkSeqs = [];
+          this.#abandonStreamBridge();
         }
         // role === "toolResult" is bridged in message_end (deduped vs tool_execution_end).
         this.#commitStepStart();
@@ -754,7 +812,7 @@ export class OmpAgent implements Agent {
           const failure = ompFailure(message);
           if (failure !== undefined) {
             this.#pendingFailure = failure;
-            this.#chunkSeqs = [];
+            this.#abandonStreamBridge();
           } else {
             this.#appendAssistantMessage(message);
           }
@@ -825,17 +883,35 @@ export class OmpAgent implements Agent {
     }
   }
 
+  /** The open stream bridge for this message, starting one on first use. */
+  #ensureStreamBridge(): AssistantStreamBridge {
+    if (this.#streamBridge === undefined || this.#streamBridge.ended) {
+      this.#streamBridge = new AssistantStreamBridge(
+        this.session.id,
+        ++this.#assistantAttemptCounter,
+        () => ++this.#assistantStreamRevision,
+        (frame) => this.#dispatch.emit("agent/assistant-stream", { frame }),
+      );
+      this.#streamBridge.start(this.#dashTurn, this.#step);
+    }
+    return this.#streamBridge;
+  }
+
+  /** Abandon any open stream bridge — failure paths never settle. */
+  #abandonStreamBridge(): void {
+    if (this.#streamBridge !== undefined && !this.#streamBridge.ended) this.#streamBridge.abandon();
+    this.#streamBridge = undefined;
+  }
+
   #handleUpdate(delta: OmpAssistantMessageEvent): void {
     switch (delta.type) {
       case "text_delta":
         if (typeof delta.delta === "string" && delta.delta !== "") {
           const chunk: StreamChunk = { type: "text-delta", index: delta.contentIndex ?? 0, text: delta.delta };
-          const seq = this.session.append("assistant/chunk", {
-            turn: this.#dashTurn,
-            step: this.#step,
-            chunk,
-          }).seq;
-          this.#chunkSeqs.push(seq);
+          // v2: live text no longer appends `assistant/chunk` log events — the
+          // stream publishes as dense agent frames and embeds durably in the
+          // final assistant/message.
+          this.#ensureStreamBridge().push(chunk);
         }
         break;
       default:
@@ -935,16 +1011,20 @@ export class OmpAgent implements Agent {
         model: String(message.model ?? this.options.model ?? ""),
       },
     });
-    this.session.append("assistant/message", {
+    const bridge = this.#streamBridge;
+    // v2: the attempt's timed chunks embed in the event itself;
+    // `sourceEventSeqs` is forbidden on assistant/message in v2.
+    const event = this.session.append("assistant/message", {
       turn: this.#dashTurn,
       step: this.#step,
       message: assistant,
+      stream: bridge?.records ?? [],
       ...(usage === undefined ? {} : { usage }),
     }, {
       surfaceOp: "append",
-      sourceEventSeqs: this.#chunkSeqs,
     });
-    this.#chunkSeqs = [];
+    if (bridge !== undefined && !bridge.ended) bridge.settle(event.seq);
+    this.#streamBridge = undefined;
   }
 
   #appendToolResult(event: RpcEvent): void {

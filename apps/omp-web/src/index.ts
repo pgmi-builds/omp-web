@@ -41,11 +41,11 @@ import { SingleOmpPresetRoster } from "./agent-preset-omp.js";
 import { resolveEntryById } from "./pairing.js";
 import { cwdFromSessionFile, foreignWriterPid, OMP_SESSIONS_ROOT, readOmpDefaultModelFromConfig, sessionHeaderId } from "./omp-store.js";
 import { supervisor } from "./supervisor.js";
+import { ompProviderIds } from "./models.js";
 import { STORAGE_RECONCILE_INTERVAL_MS } from "./knobs.js";
 import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents } from "./permission.js";
-import { ompProviderIds } from "./models.js";
 import { closeBridgeStore, getBridgeStore, initBridgeStore } from "./store/index.js";
-import { reconcileOnce, upsertCreated } from "./store/reconcile.js";
+import { reconcileOnce, syncSessionHeader, upsertCreated } from "./store/reconcile.js";
 
 /** Bounded grace for avoidance hand-off: abort then wait this long before forced teardown. */
 const AVOIDANCE_GRACE_MS = 10_000;
@@ -67,15 +67,31 @@ const trace = (...parts: unknown[]): void => {
 };
 
 /**
- * The slice of `ctx.sessionPersistence` (dsh-session-persistence) resume
- * depends on. Typed locally so the plugin needs no dependency on the
- * persistence package; the runtime contract is stable (`load` returns the
- * durable log, `prepare` restores it as an unpublished `SessionPreparation`).
+ * The slice of `ctx.sessionPersistence` (dsh-session-persistence v2) resume
+ * depends on. Typed locally so the plugin needs no dependency surface beyond
+ * the handle read: `open(id, "read")` + `handle.read()` restore the durable
+ * log — the v2 replacement for the removed `load`/`prepare` pair.
  */
 interface SessionPersistenceSlice {
-  list(signal?: AbortSignal): Promise<{ id: string }[]>;
-  load(id: SessionId): Promise<{ events: SessionEvent[] }>;
-  prepare(id: SessionId, signal?: AbortSignal): Promise<SessionPreparation>;
+  open(
+    id: SessionId,
+    access: "read",
+    options?: { signal?: AbortSignal },
+  ): Promise<{ read(): Promise<{ events: SessionEvent[] }>; close(): Promise<void> }>;
+}
+
+/** Open a read handle, pull the complete stored log, close. */
+async function readStoredEvents(
+  persistence: SessionPersistenceSlice,
+  id: SessionId,
+  signal?: AbortSignal,
+): Promise<SessionEvent[]> {
+  const handle = await persistence.open(id, "read", signal === undefined ? undefined : { signal });
+  try {
+    return [...(await handle.read()).events];
+  } finally {
+    await handle.close();
+  }
 }
 
 /** The slice of `ctx.workspaceRegistry` the boot workspace-reconcile reads. */
@@ -291,21 +307,32 @@ export class OmpProvider extends Service implements AgentFactory {
       // travels with it for cold permission synthesis. Best-effort contract.
       const state = await rpc.getState();
 
+      // Prepare the unpublished session FIRST (mirrors dsh-agent-loop's
+      // SessionPreparation): its stamped header is the single source of truth
+      // for the row below. v2 folds header identity across live/listed/loaded
+      // observations, so a row created_at from an independent Date.now() call
+      // would make every session/list observation conflict with the live one.
+      const preparation = SessionPreparation.create(loopCtx.sessions.prepare(id, {
+        ...(options.seed === undefined ? {} : { seed: options.seed }),
+        ...(meta === undefined ? {} : { meta }),
+      }));
+
       if (state.sessionFile !== undefined) {
         const store = getBridgeStore();
         if (store !== undefined) {
           const ompId = state.sessionId ?? sessionHeaderId(state.sessionFile);
           if (ompId !== undefined) {
-            upsertCreated(store, { ompSessionId: ompId, sessionFile: state.sessionFile, dshSessionId: id, ...(cwd === undefined ? {} : { cwd }), ...(preset === undefined ? {} : { preset }) });
+            upsertCreated(store, {
+              ompSessionId: ompId,
+              sessionFile: state.sessionFile,
+              dshSessionId: id,
+              createdAt: preparation.session.header.createdAt,
+              cwd: preparation.session.header.cwd ?? cwd,
+              ...(preset === undefined ? {} : { preset }),
+            });
           }
         }
       }
-
-      // Prepare the unpublished session (mirrors dsh-agent-loop's SessionPreparation).
-      const preparation = SessionPreparation.create(loopCtx.sessions.prepare(id, {
-        ...(options.seed === undefined ? {} : { seed: options.seed }),
-        ...(meta === undefined ? {} : { meta }),
-      }));
 
       const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation.session, rpc, "startup", { enterSession: true, preparation });
 
@@ -372,7 +399,7 @@ export class OmpProvider extends Service implements AgentFactory {
     const preset =
       getBridgeStore()?.byDshId(String(id))?.permission_preset ??
       (persistence !== undefined
-        ? presetFromEvents((await persistence.load(id)).events)
+        ? presetFromEvents(await readStoredEvents(persistence, id, options.signal))
         : undefined);
     const approvalMode = envMode ?? ompApprovalMode(preset);
     trace(`resume id=${id} preset=${preset ?? "none"} approval-mode=${approvalMode}${envMode === undefined ? "" : " (env override)"}`);
@@ -426,15 +453,27 @@ export class OmpProvider extends Service implements AgentFactory {
 
       // Fresh attach: seed the Dash session log by replaying the OMP transcript
       // through the union persistence (scan → readMessages → replay).
-      const preparation = await (persistence !== undefined
-        ? persistence.prepare(id, options.signal)
-        : SessionPreparation.create(loopCtx.sessions.prepare(id, {
-            seed: replayOmpMessages(await rpc.getMessages()),
-            meta: {
-              ...(spawnCwd === undefined ? {} : { cwd: spawnCwd }),
-              createdAt: record.createdAt,
-            },
-          })));
+      // Fresh attach: seed the Dash session log by replaying the OMP
+      // transcript — through the union persistence when mounted (scan →
+      // replay), else directly off the re-attached RPC.
+      const seedEvents =
+        persistence !== undefined
+          ? await readStoredEvents(persistence, id, options.signal)
+          : replayOmpMessages(await rpc.getMessages());
+      const preparation = SessionPreparation.create(
+        loopCtx.sessions.prepare(id, {
+          seed: seedEvents,
+          meta: {
+            createdAt: record.createdAt,
+            ...(spawnCwd === undefined ? {} : { cwd: spawnCwd }),
+          },
+        }),
+      );
+      // v2 header identity: mirror the prepared header onto the index row so
+      // listed/loaded observations agree with the live one (the row's
+      // insertion-instant created_at and the OMP-record epoch can drift).
+      const resumeStore = getBridgeStore();
+      if (resumeStore !== undefined) syncSessionHeader(resumeStore, String(id), preparation.session.header);
       trace(`resume id=${id} replayed transcript from OMP store`);
 
       const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation.session, rpc, "resume", { enterSession: true, preparation });

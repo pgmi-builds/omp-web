@@ -12,17 +12,18 @@ import type { ResolvedRetryPolicy } from './retry-policy.ts';
 import type { ProviderRequestId } from './brand.ts';
 import type { LlmCallConfig, LlmCallConfigAdapterDefaults } from './call-config.ts';
 import { HarnessError } from './error.ts';
+import type { FileAttachmentRef } from '@deepseek-ai/dsh-attachment';
 export * from './attribution.ts';
 export * from './brand.ts';
-export * from './never.ts';
 export * from './error.ts';
 export * from './api-key.ts';
 export * from './types.ts';
 export * from './content.ts';
+export * from './assistant-stream.ts';
 export * from './message.ts';
 export * from './retry-policy.ts';
 export { BlockAssembler } from './assembler.ts';
-export { callConfigEquals, deepFreeze, isAgentLoopRequest, markAgentLoopRequest } from './call-config.ts';
+export { callConfigEquals, isAgentLoopRequest, markAgentLoopRequest } from './call-config.ts';
 export type { LlmCallConfig, LlmCallConfigAdapterDefaults } from './call-config.ts';
 declare module '@deepseek-ai/cordis' {
     interface Context {
@@ -304,7 +305,7 @@ export declare class LlmRuntime extends TypertRemoteService {
      * @param request - endpoint, protocol, and one-shot credential to use.
      * @param signal - caller cancellation supplied by the Remote carrier.
      * @returns advertised models in endpoint order.
-     * @throws TypertRemoteFailure with `model-discovery-failed` when discovery refuses or fails.
+     * @throws RemoteError with `llm/model-discovery-rejected` when discovery refuses or fails.
      */
     remoteDiscoverModels(settingsNs: string, request: LlmModelDiscoveryRequest, signal: AbortSignal): Promise<LlmDiscoveredModel[]>;
     /**
@@ -323,6 +324,13 @@ export declare class LlmRuntime extends TypertRemoteService {
      * @returns the owning adapter's image pricing for the route, when declared.
      */
     imageRequestPricing(provider: string, model: string): LlmImageRequestPricing | undefined;
+    /**
+     * Resolve the exact text one durable file occurrence contributes to every
+     * provider request in the current execution environment.
+     * @param ref - durable verbatim file reference from model history.
+     * @returns the same deterministic handle text used at adapter dispatch.
+     */
+    fileRequestText(ref: FileAttachmentRef): string;
     /** Detach typed adapter-owned modality metadata. */
     private detachedModalities;
     /**
@@ -371,6 +379,11 @@ export declare class LlmRuntime extends TypertRemoteService {
     private registration;
     /** Remove replay state whose historical route is owned by another adapter. */
     private forAdapter;
+    /**
+     * Resolve the current execution-world read path of one durable file
+     * reference through the mounted attachment and filesystem providers.
+     */
+    private fileReadPath;
     /**
      * Final adapter boundary. Adapter selection, dispatch, iterator construction,
      * and iteration failures become one terminal failure chunk. Middleware and

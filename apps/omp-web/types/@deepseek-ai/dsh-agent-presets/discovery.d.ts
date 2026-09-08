@@ -45,6 +45,22 @@ export declare const USER_PRESET_DIR = ".agent-presets";
  */
 export declare const SHIPPED_PRESET_ROOT: string;
 /**
+ * Why `rows` cannot be an entry list, or undefined when it can.
+ *
+ * A shallow shape check, deliberately short of the loader's work: it does not
+ * resolve plugin names or apply configs. What it catches is the hand-edit
+ * that produces a file the loader cannot even begin with — and it must accept
+ * everything the loader accepts, which is why rows are only required to be
+ * maps carrying a plugin `name` (groups recurse into their own lists).
+ *
+ * Shared with the composition inventory, whose file reads race edits against
+ * the health verdict and must judge the raced content by the same rule.
+ * @param rows - the parsed composition document.
+ * @param at - row-path prefix for nested diagnostics, empty at the top level.
+ * @returns one human-readable reason, or undefined when the shape holds.
+ */
+export declare function entryListProblem(rows: unknown, at?: string): string | undefined;
+/**
  * Scan one root for preset directories.
  *
  * An absent root yields no presets rather than throwing: the user root does

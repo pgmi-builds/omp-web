@@ -16,7 +16,7 @@
 import { Context, type Fiber } from '@deepseek-ai/cordis';
 import type { EntryTree } from '@deepseek-ai/cordis-plugin-loader';
 import { type ScopeKey } from '@deepseek-ai/dsh-scope';
-import { type AgentPreset } from './preset.ts';
+import type { AgentPreset } from './preset.ts';
 /** One preset composition currently installed under some agent. */
 export interface PresetMount {
     /** The preset the subtree was composed from. */
@@ -31,9 +31,15 @@ export interface PresetMount {
 /**
  * Every preset composition still installed, pruning fibers disposed since the
  * last read.
+ *
+ * The record set is module state and therefore spans every Cordis runtime in
+ * the process; a reader that serves one runtime passes that runtime's root
+ * fiber so another runtime mounting the same preset id (a second embedded
+ * app, a test's second harness) never answers for it.
+ * @param within - when present, only mounts inside this fiber's subtree.
  * @returns the live mounts.
  */
-export declare function livePresetMounts(): PresetMount[];
+export declare function livePresetMounts(within?: Fiber): PresetMount[];
 /**
  * Service names the mounted subtree published into the root realm.
  *

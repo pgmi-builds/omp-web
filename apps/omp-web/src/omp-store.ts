@@ -132,7 +132,7 @@ export function lastModelCall(messages: OmpMessage[]): { provider: string; model
 }
 
 /** Split a `provider/model[:variant]` selector into provider/model, dropping the variant suffix. */
-function parseSelector(selector: string | undefined): { provider: string; model: string } | undefined {
+export function parseSelector(selector: string | undefined): { provider: string; model: string } | undefined {
   if (selector === undefined) return undefined;
   const slash = selector.indexOf("/");
   if (slash <= 0) return undefined;

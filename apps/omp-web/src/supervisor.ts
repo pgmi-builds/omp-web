@@ -13,7 +13,7 @@
  * foreign prompt — found while replaying file growth past a per-entry cursor.
  */
 import { statSync } from "node:fs";
-import { SessionPreparation, type Session, type SessionEvent } from "@deepseek-ai/dsh-session";
+import { SessionPreparation, SessionSeq, type Session, type SessionEvent } from "@deepseek-ai/dsh-session";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { readOmpTranscript, scanForeignWriters } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
@@ -27,6 +27,8 @@ interface SessionsSlice {
   prepare(id: string, init: { seed?: SessionEvent[]; meta?: Record<string, unknown> }): Session;
   enter(session: Session): () => void;
   announce(session: Session): void;
+  /** Membership probe: an id already live in the store must not be re-prepared (prepare throws). */
+  get(id: string): Session | undefined;
 }
 
 type ReplayedEvent = SessionEvent & { surfaceOp?: "append"; sourceEventSeqs?: number[] };
@@ -296,7 +298,7 @@ export class Supervisor {
           // live bridge omits the key entirely, so mirror that.
           appendTo.append(event.type, event.data, event.sourceEventSeqs === undefined
             ? { surfaceOp: "append" }
-            : { surfaceOp: "append", sourceEventSeqs: event.sourceEventSeqs });
+            : { surfaceOp: "append", sourceEventSeqs: event.sourceEventSeqs.map((seq) => SessionSeq(seq)) });
         } else {
           appendTo.append(event.type, event.data);
         }
@@ -336,6 +338,14 @@ export class Supervisor {
 
   async #materialize(id: string, entry: Entry): Promise<void> {
     if (entry.shadow !== undefined || this.sessions === undefined) {
+      entry.materializing = false;
+      return;
+    }
+    // Idempotency: the id may have gone live between scheduling and this run
+    // (e.g. a concurrent resume published it). SessionStore.prepare throws on a
+    // duplicate id — treat live as already-materialized (observed upstream as
+    // `materialize ... failed: session "X" already exists` in prod journals).
+    if (this.sessions.get(id) !== undefined) {
       entry.materializing = false;
       return;
     }

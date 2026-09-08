@@ -37,9 +37,13 @@ function rowFromEntry(entry: OmpNativeSession, existing?: SessionRow): SessionRo
     omp_session_id: entry.ompSessionId,
     dsh_session_id: existing?.dsh_session_id ?? derivedDashId(entry.ompSessionId),
     session_file: entry.ompSessionFile,
-    cwd: entry.cwd ?? null,
+    // v2 header identity: created_at and cwd are bridge-authored for paired
+    // rows (they must equal the live/prepared Dash session header exactly, or
+    // session-query throws SOURCE_CONFLICT). Only fill them on first sight;
+    // the scan's transcript-derived values are for TUI-born rows.
+    cwd: existing?.cwd ?? (entry.cwd ?? null),
     title: entry.title ?? null,
-    created_at: entry.createdAt,
+    created_at: existing?.created_at ?? entry.createdAt,
     last_modified_at: entry.mtimeMs,
     transcript_size: entry.size,
     model_provider: model?.provider ?? null,
@@ -75,7 +79,7 @@ export function reconcileOnce(store: BridgeStore): void {
 /** Event-driven INSERT at createAgent: record identity + preset; reconcile fills metadata. */
 export function upsertCreated(
   store: BridgeStore,
-  input: { ompSessionId: string; sessionFile: string; dshSessionId: string; cwd?: string; preset?: string },
+  input: { ompSessionId: string; sessionFile: string; dshSessionId: string; cwd?: string; preset?: string; createdAt?: number },
 ): void {
   let size = 0;
   let mtimeMs = Date.now();
@@ -92,7 +96,10 @@ export function upsertCreated(
     session_file: input.sessionFile,
     cwd: input.cwd ?? null,
     title: null,
-    created_at: Date.now(),
+    // v2 header identity: the row's created_at MUST equal the live session
+    // header's createdAt, or session-query's cross-observation header check
+    // (assertSessionHeadersCompatible) throws SOURCE_CONFLICT for the id.
+    created_at: input.createdAt ?? Date.now(),
     last_modified_at: mtimeMs,
     transcript_size: size,
     model_provider: null,
@@ -103,6 +110,24 @@ export function upsertCreated(
     archived: 0,
     last_visited_at: null,
   });
+}
+
+/**
+ * Mirror a live session header back onto its index row: v2 folds the header
+ * identity across live, listed, and loaded observations, so the row must
+ * carry the exact createdAt/cwd the prepared session carries. No-op when the
+ * row is absent (nothing observes an unindexed id) or already in sync.
+ */
+export function syncSessionHeader(
+  store: BridgeStore,
+  dshSessionId: string,
+  header: { readonly createdAt: number; readonly cwd?: string },
+): void {
+  const row = store.byDshId(dshSessionId);
+  if (row === undefined) return;
+  const cwd = header.cwd ?? row.cwd;
+  if (row.created_at === header.createdAt && row.cwd === cwd) return;
+  store.upsert({ ...row, created_at: header.createdAt, cwd });
 }
 
 /**

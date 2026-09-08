@@ -14,7 +14,7 @@
  * values, exactly what `Session`'s seed validator requires.
  */
 import { ToolCallId, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
-import type { SessionEvent, TurnEndReason } from "@deepseek-ai/dsh-session";
+import { SessionSeq, type SessionEvent, type TurnEndReason } from "@deepseek-ai/dsh-session";
 import type { OmpMessage } from "./rpc.js";
 import { convertContent, convertUsage, ompFailure } from "./agent.js";
 import { lastModelCall, lastRestorableModel, type OmpModelChange } from "./omp-store.js";
@@ -120,8 +120,11 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
         const usage = convertUsage(message.usage);
         push(
           "assistant/message",
-          { turn, step, message: assistant, ...(usage === undefined ? {} : { usage }) },
-          { surfaceOp: "append", sourceEventSeqs: [] },
+          // v2: assistant/message REQUIRES the embedded stream (empty here —
+          // OMP transcripts carry no timed deltas) and must NOT cite
+          // sourceEventSeqs (the stream travels inside the event).
+          { turn, step, message: assistant, stream: [], ...(usage === undefined ? {} : { usage }) },
+          { surfaceOp: "append" },
         );
         break;
       }
@@ -175,10 +178,10 @@ export function replayOmpTranscript(
         type: "request/header",
         seq: 0,
         time: replayed[0]?.time ?? Date.now(),
-        data: { header: { config } },
+        data: { header: { config }, reason: "resume" },
       } as unknown as SessionEvent,
       ...replayed,
-    ].map((event, index) => ({ ...event, seq: index }));
+    ].map((event, index) => ({ ...event, seq: SessionSeq(index) }));
   }
   const events: SessionEvent[] = [
     {
@@ -194,10 +197,10 @@ export function replayOmpTranscript(
             type: "request/header",
             seq: 0,
             time: titleTime ?? replayed[0]?.time ?? Date.now(),
-            data: { header: { config } },
+            data: { header: { config }, reason: "resume" },
           } as unknown as SessionEvent,
         ]),
     ...replayed,
   ];
-  return events.map((event, index) => ({ ...event, seq: index }));
+  return events.map((event, index) => ({ ...event, seq: SessionSeq(index) }));
 }

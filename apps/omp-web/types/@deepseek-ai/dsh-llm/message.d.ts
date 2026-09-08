@@ -1,5 +1,5 @@
 /** Message value types, identity, and immutable construction helpers. */
-import { MessageId, type ToolCallId } from './brand.ts';
+import type { MessageId, ToolCallId } from './brand.ts';
 import type { ContentBlock, ToolResultBlock } from './types.ts';
 /** Provider/model identity and adapter-private replay data for an assistant message. */
 export interface AssistantProvenance {

@@ -4,7 +4,7 @@
  * mapped interfaces make the content, source, and finish unions extensible.
  */
 import type { Branded } from '@deepseek-ai/dsh-brand';
-import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
+import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment';
 import type { ToolCallId, ProviderRequestId, ReasoningEffortId } from './brand.ts';
 import type { Message } from './message.ts';
 declare module '@deepseek-ai/cordis' {
@@ -56,6 +56,18 @@ export interface ImageBlock {
     /** Immutable bytes and intrinsic display metadata owned by the attachment service. */
     attachment: ImageAttachmentRef;
 }
+/**
+ * A durable verbatim file reference, valid in user content. Files never reach
+ * a provider natively: request assembly projects every occurrence to
+ * deterministic handle text (name, byte size, and the read-only saved path),
+ * so adapters and providers see text in its place while the durable log keeps
+ * the structured reference for presentation and authorization.
+ */
+export interface FileBlock {
+    type: 'file';
+    /** Immutable verbatim bytes and display metadata owned by the attachment service. */
+    attachment: FileAttachmentRef;
+}
 /** A tool invocation requested by the model. */
 export interface ToolCallBlock {
     type: 'tool-call';
@@ -80,6 +92,7 @@ export interface ContentBlockMap {
     'text': TextBlock;
     'reasoning': ReasoningBlock;
     'image': ImageBlock;
+    'file': FileBlock;
     'tool-call': ToolCallBlock;
     'tool-result': ToolResultBlock;
 }
@@ -234,14 +247,14 @@ export interface LlmModelDiscoveryOperation extends LlmModelDiscoveryRequest {
     /** Caller cancellation; implementations must settle promptly after it aborts. */
     signal?: AbortSignal;
 }
-/** Stable failure returned by the `llm/discoverModels` Remote method. */
-export interface LlmModelDiscoveryError {
-    readonly code: 'model-discovery-failed';
-    readonly message: string;
-    readonly details: {
-        readonly settingsNs: string;
-        readonly baseURL?: string;
-    };
+declare module '@deepseek-ai/dsh-typert-protocol' {
+    interface RemoteErrorDetailsMap {
+        /** A draft provider interrogation refused or failed. */
+        'llm/model-discovery-rejected': {
+            readonly settingsNs: string;
+            readonly baseURL?: string;
+        };
+    }
 }
 /**
  * One model an endpoint reports about itself. Every field but the id is

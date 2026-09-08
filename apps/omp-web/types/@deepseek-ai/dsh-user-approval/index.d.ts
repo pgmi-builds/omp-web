@@ -7,7 +7,7 @@ import { Context, Service } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { type ToolCallId } from '@deepseek-ai/dsh-llm';
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
+import type { Session } from '@deepseek-ai/dsh-session';
 declare module '@deepseek-ai/cordis' {
     interface Context {
         approval: ApprovalService;
@@ -19,7 +19,7 @@ declare module '@deepseek-ai/dsh-session/types' {
          * The session's approval policy was switched — log-only, durable,
          * replayable, never in the model transcript (the model learns the policy
          * from the runtime-context snapshot and live switch notices). The LAST
-         * such event is the session's override ({@link effectiveApprovalPolicy}).
+         * such event is the session's override.
          * `source: 'delegation'` marks an override seeded into a child; an absent
          * source is a runtime switch.
          */
@@ -46,15 +46,6 @@ export type { ApprovalOutcome } from './types.ts';
 export type ApprovalPolicy = 'ask' | 'never';
 /** Every {@link ApprovalPolicy}, for option advertisement and runtime validation of untrusted policy strings. */
 export declare const APPROVAL_POLICIES: readonly ApprovalPolicy[];
-/**
- * The session's approval-policy override: the last `approval/policy` event in
- * the log, or undefined when the session never switched (callers apply the
- * plugin's configured default). The pure fold — resume needs no catch-up
- * machinery because replaying the log IS the state.
- * @param events - session events in log order (other event types are skipped).
- * @returns the policy of the last switch event, or undefined without one.
- */
-export declare function effectiveApprovalPolicy(events: readonly SessionEvent[]): ApprovalPolicy | undefined;
 /**
  * Append the sole durable representation of a session policy override. Invalid
  * values throw before the log changes; consumers fold the new value on each read.

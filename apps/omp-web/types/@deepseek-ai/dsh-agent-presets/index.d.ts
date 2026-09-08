@@ -26,8 +26,10 @@ import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import { type ScopeKey } from '@deepseek-ai/dsh-scope';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { AgentPresetDocument, AgentPresetRoster } from './types.ts';
-import { type AgentPreset, type Config, type PresetRoot } from './preset.ts';
+import { type AgentPresetComposition } from './composition-inventory.ts';
+import type { AgentPreset, Config, PresetRoot } from './preset.ts';
 export type * from './types.ts';
+export type { AgentPresetComposition, AgentPresetCompositionRow, CompositionRowEnablement, } from './composition-inventory.ts';
 /** Settings namespace carrying the user's chosen default preset. */
 export declare const SETTINGS_NAMESPACE = "agent-presets";
 /** The user-writable slice of this plugin's config. */
@@ -40,9 +42,8 @@ export declare const AgentPresetSettingsSchema: z<AgentPresetSettings>;
 export { COMPOSITION_FILE, discoverPresets, scanRoot, SHIPPED_PRESET_ROOT } from './discovery.ts';
 export { METADATA_FILE, readPresetMetadata, renderPresetMetadata, type PresetMetadata, } from './metadata.ts';
 export { inactiveRows, leakedServices, livePresetMounts, mountPreset, serviceForAgent, standingMountFor, type JoinedPresetMount, type PresetMount, } from './mount.ts';
-export { copyComposition, deleteComposition, InvalidPresetIdError, PresetExistsError, PresetNotWritableError, readComposition, writableRoot, } from './authoring.ts';
+export { copyComposition, deleteComposition, readComposition, writableRoot } from './authoring.ts';
 export { agentPresetProjectionDefinition } from './session.ts';
-export { PresetLockedError, PresetMountError, UnknownPresetError } from './preset.ts';
 export type { AgentPreset, Config, PresetRoot, PresetTrust } from './preset.ts';
 declare module '@deepseek-ai/cordis' {
     interface Context {
@@ -128,6 +129,24 @@ export declare class AgentPresets extends TypertRemoteService {
      * @returns the rows and the authoring capability.
      */
     remoteExportList(): Promise<AgentPresetRoster>;
+    /**
+     * Every preset's composition as flattened plugin rows, for plugin-listing
+     * surfaces beside the roster's own picker.
+     *
+     * A preset with a live standing mount answers from its newest generation's
+     * Loader entries — the composition new sessions join — even when the file
+     * behind it has since been edited into an unreadable state: the mount is
+     * what sessions actually run, so the broken verdict only applies to a
+     * preset nothing composed. One never composed since boot answers from its
+     * file, with `!!js` disabled gates evaluated against the Loader context so
+     * both answers reflect the same host. Reading never mounts: an unmounted
+     * preset is parsed, not composed, so listing a preset's plugins cannot
+     * activate them early. A composition that stopped reading between
+     * discovery's health verdict and this read is reported broken with the
+     * raced reason rather than dropped.
+     * @returns one composition per roster preset, in roster order.
+     */
+    compositionInventory(): Promise<AgentPresetComposition[]>;
     /**
      * Resolve one preset by id.
      *
@@ -241,8 +260,8 @@ export declare class AgentPresets extends TypertRemoteService {
      * One preset's composition text with the roster row it belongs to.
      * @param agentPreset - the preset id.
      * @returns the composition beside its trust and published metadata.
-     * @throws {TypertRemoteFailure} `bad-request` for an empty id, or
-     * `agent-preset-not-found` when no configured root supplies it.
+     * @throws {RemoteError} `gateway/bad-request` for an empty id, or
+     * `agent-preset/not-found` when no configured root supplies it.
      */
     readDocument(agentPreset: string): Promise<AgentPresetDocument>;
     /**
@@ -267,8 +286,8 @@ export declare class AgentPresets extends TypertRemoteService {
      * @param id - the new preset id.
      * @param name - the copy's optional display name.
      * @returns once the copy is stored.
-     * @throws {TypertRemoteFailure} with the corresponding stable preset code
-     * and details when the copy is refused.
+     * @throws {RemoteError} with the corresponding stable preset code and
+     * details when the copy is refused.
      */
     remoteExportCopy(from: string, id: string, name?: string): Promise<void>;
     /**
@@ -282,8 +301,8 @@ export declare class AgentPresets extends TypertRemoteService {
      * Delete one preset through the Remote API.
      * @param id - the preset id.
      * @returns once the preset is deleted.
-     * @throws {TypertRemoteFailure} with the corresponding stable preset code
-     * and details when deletion is refused.
+     * @throws {RemoteError} with the corresponding stable preset code and
+     * details when deletion is refused.
      */
     remoteExportDelete(id: string): Promise<void>;
     /**
@@ -344,8 +363,8 @@ export declare class AgentPresets extends TypertRemoteService {
      * @param agent - the session's live agent, resolved from the wire identity.
      * @param agentPreset - the preset to compose the agent from instead.
      * @returns the preset id that was recorded.
-     * @throws {TypertRemoteFailure} with `bad-request`, `agent-preset-locked`,
-     * `agent-preset-not-found`, or `agent-preset-invalid` when refused.
+     * @throws {RemoteError} with `gateway/bad-request`, `agent-preset/locked`,
+     * `agent-preset/not-found`, or `agent-preset/invalid` when refused.
      */
     select(agent: Agent, agentPreset: string): Promise<string>;
     /** One queued switch: re-check, recompose, then record what the agent runs. */

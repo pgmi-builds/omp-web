@@ -8,6 +8,7 @@
  * @module @deepseek-ai/dsh-session/surface
  */
 import type { Message } from '@deepseek-ai/dsh-llm';
+import { SessionLogOffset, SessionSeq } from './types.ts';
 import type { SessionEvent, SurfaceEvent, SurfaceOp } from './types.ts';
 /**
  * Whether an event type can join the model-visible surface.
@@ -49,7 +50,7 @@ export declare function isReplacementSurfaceEvent(event: SessionEvent): event is
 };
 /**
  * Project a single event into the LLM message it derives to, or null when it
- * produces none — a non-surface event (chunk, boundary, log-only record) or an
+ * produces none — a non-surface event (attempt, boundary, log-only record) or an
  * empty-content assistant/message (which exists only to host usage). This is
  * THE per-node projection rule: `Session.deriveMessages` folds it over the
  * live surface, external reconstructors and pure projections fold the same
@@ -64,25 +65,25 @@ export declare function deriveEventMessage(event: SessionEvent): Message | null;
 /** One replacement operation observed while folding a session surface. */
 export interface SurfaceFoldReplacement {
     /** Seq of the event that replaced the prior surface range. */
-    seq: number;
+    seq: SessionSeq;
     /** Declared inclusive start seq of the replaced surface range. */
-    start: number;
+    start: SessionSeq;
     /** Declared inclusive end seq of the replaced surface range. */
-    end: number;
+    end: SessionSeq;
     /** Actual surface entries removed by the operation, in surface order. */
-    shadowedSeqs: number[];
+    shadowedSeqs: SessionSeq[];
 }
 /** Complete result of replaying the surface operations in a session log. */
 export interface SurfaceFoldResult {
     /** Current surface event sequences in model-visible order. */
-    nodes: number[];
+    nodes: SessionSeq[];
     /** Replacement operations in event order. */
     replacements: SurfaceFoldReplacement[];
 }
 /** Readonly live projection of the message-producing session events. */
 export interface SessionSurface {
     /** Current surface event sequences in model-visible order. */
-    readonly nodes: readonly number[];
+    readonly nodes: readonly SessionSeq[];
     /** Monotonic count of committed positional replacements. */
     readonly replaceGeneration: number;
 }
@@ -107,7 +108,7 @@ export declare class SurfaceManager implements SessionSurface {
      * @param log - Contiguous complete log or loaded event window.
      * @param baseSeq - Absolute sequence of the window's first event.
      */
-    constructor(log: readonly SessionEvent[], baseSeq?: number);
+    constructor(log: readonly SessionEvent[], baseSeq?: SessionLogOffset);
     /**
      * Validate the next candidate without mutating the committed surface.
      * @param event - candidate event that has not entered the log yet.
@@ -116,7 +117,7 @@ export declare class SurfaceManager implements SessionSurface {
     /** Monotonic count of folded positional replacements. */
     get replaceGeneration(): number;
     /** Surface event sequences in model-visible order. */
-    get nodes(): readonly number[];
+    get nodes(): readonly SessionSeq[];
     /** Fold events appended since the previous access. */
     private _processDelta;
 }

@@ -39,9 +39,10 @@ import { OmpLlmAdapter } from "./adapter.js";
 import { OmpUnionSessionPersistence } from "./session-persistence-omp.js";
 import { SingleOmpPresetRoster } from "./agent-preset-omp.js";
 import { resolveEntryById } from "./pairing.js";
-import { cwdFromSessionFile, foreignWriterPid, OMP_SESSIONS_ROOT, readOmpDefaultModelFromConfig, sessionHeaderId } from "./omp-store.js";
+import { cwdFromSessionFile, foreignWriterPid, OMP_SESSIONS_ROOT, parseSelector as parseModelSelector, sessionHeaderId } from "./omp-store.js";
 import { supervisor } from "./supervisor.js";
-import { ompProviderIds } from "./models.js";
+import { ompModelRoles, ompSetModelRoles } from "./omp-cli.js";
+import { ompProviderIds, refreshOmpModelsCli } from "./models.js";
 import { STORAGE_RECONCILE_INTERVAL_MS } from "./knobs.js";
 import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents } from "./permission.js";
 import { closeBridgeStore, getBridgeStore, initBridgeStore } from "./store/index.js";
@@ -116,8 +117,10 @@ export class OmpProvider extends Service implements AgentFactory {
   private stopFollow: () => void = () => {};
   /** Live RPC-backed agents by dash id, for avoidance hand-off. */
   private readonly heldAgents = new Map<string, AgentHandle>();
-  /** Last synced OMP default model key (`provider/model`), to skip no-op syncs. */
-  #lastOmpDefaultModelKey = "";
+  /** Shadow of OMP's `modelRoles.default` (`provider/model`) seen last tick. */
+  #ompDefaultKey = "";
+  /** Shadow of DSH's agentDefaultModel selection (`provider/model`) seen last tick. */
+  #dshSelectionKey = "";
 
   constructor(ctx: Context) {
     super(ctx, "ompProvider");
@@ -127,7 +130,7 @@ export class OmpProvider extends Service implements AgentFactory {
     // Boot the centralized index BEFORE any service reads session state: warm
     // pass + migration, so the first landing sees real titles/models (D5.1).
     initBridgeStore();
-    this.#syncOmpDefaultModel();
+    void this.#syncModelDefaultTick();
     // Phase B surfaces: the union persistence (Dash JSONL logs ⊕ OMP's native
     // store scan) serves session.list / cold history / resume ownership, and
     // the single-preset roster puts one "OMP" entry on the mode dropdown and
@@ -159,23 +162,54 @@ export class OmpProvider extends Service implements AgentFactory {
   }
 
   /**
-   * Track OMP's `modelRoles.default` (config.yml) into the store's
-   * `omp_default_model` and DSH's `ctx.agentDefaultModel`, so new sessions start
-   * from the same default the OMP TUI uses. No-op unless the value changed.
+   * Two-way default-model sync, evaluated once per reconcile tick (and once
+   * at boot): OMP's `modelRoles.default` (CLI) ↔ DSH's `agentDefaultModel`
+   * selection. TUI semantics on both sides — a default write survives
+   * sessions. Direction is decided by shadow keys: whichever side moved
+   * since the last tick wins, and an echo (same value round-tripping back)
+   * is a no-op.
    */
-  #syncOmpDefaultModel(): void {
-    const fromConfig = readOmpDefaultModelFromConfig();
-    const key = fromConfig === undefined ? "" : `${fromConfig.provider}/${fromConfig.model}`;
-    if (key === this.#lastOmpDefaultModelKey) return;
-    this.#lastOmpDefaultModelKey = key;
-    if (fromConfig === undefined) return;
-    getBridgeStore()?.setOmpDefaultModel(fromConfig.provider, fromConfig.model);
+  async #syncModelDefaultTick(): Promise<void> {
     const service = this.runtime.ctx.get("agentDefaultModel") as
-      | { saveSelection?: (selection: { provider: string; model: string }) => Promise<unknown> }
+      | {
+          currentSelection?: () => { provider: string; model: string };
+          saveSelection?: (selection: { provider: string; model: string }) => Promise<unknown>;
+        }
       | undefined;
-    void service?.saveSelection?.({ provider: fromConfig.provider, model: fromConfig.model }).catch((error: unknown) => {
+    const roles = await ompModelRoles();
+    const ompSelector = roles?.default;
+    const ompParsed = ompSelector === undefined ? undefined : parseModelSelector(ompSelector);
+    const ompKey = ompParsed === undefined ? undefined : `${ompParsed.provider}/${ompParsed.model}`;
+    const dsh = service?.currentSelection?.();
+    const dshKey = dsh === undefined ? undefined : `${dsh.provider}/${dsh.model}`;
+    try {
+      if (ompKey !== undefined && ompKey !== this.#ompDefaultKey) {
+        // OMP side moved (TUI default switch or config edit): carry it into
+        // the store and the DSH default so new Web sessions inherit it.
+        this.#ompDefaultKey = ompKey;
+        if (ompParsed !== undefined) {
+          getBridgeStore()?.setOmpDefaultModel(ompParsed.provider, ompParsed.model);
+          await service?.saveSelection?.({ provider: ompParsed.provider, model: ompParsed.model });
+          this.#dshSelectionKey = ompKey;
+          this.runtime.ctx.logger.info(`omp-provider: default model ← OMP: ${ompKey}`);
+        }
+      } else if (dshKey !== undefined && dshKey !== this.#dshSelectionKey) {
+        // DSH side moved (Web UI selector switch): propagate into OMP's
+        // modelRoles.default through the CLI so TUI sessions inherit it.
+        this.#dshSelectionKey = dshKey;
+        if (dsh !== undefined && dshKey !== this.#ompDefaultKey) {
+          const next = { ...(roles ?? {}), default: `${dsh.provider}/${dsh.model}` };
+          if (await ompSetModelRoles(next)) {
+            this.#ompDefaultKey = dshKey;
+            this.runtime.ctx.logger.info(`omp-provider: default model → OMP: ${dshKey}`);
+          } else {
+            this.runtime.ctx.logger.warn(`omp-provider: default model → OMP write failed: ${dshKey}`);
+          }
+        }
+      }
+    } catch (error) {
       this.runtime.ctx.logger.warn(`omp-provider: default model sync failed: ${String(error)}`);
-    });
+    }
   }
 
 
@@ -198,7 +232,8 @@ export class OmpProvider extends Service implements AgentFactory {
       const run = (): void => {
         const store = getBridgeStore();
         if (store !== undefined) reconcileOnce(store);
-        this.#syncOmpDefaultModel();
+        void this.#syncModelDefaultTick();
+        void refreshOmpModelsCli();
         void this.#attachScannedSessions(registry);
         supervisor.reconcile();
       };

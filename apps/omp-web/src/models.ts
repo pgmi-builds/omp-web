@@ -4,26 +4,26 @@
  * The browser model selector is a pure RPC round-trip through the apiproxy:
  * `session.models` reads `ctx.llm.listProviders/listModels/resolveModelInfo`,
  * so the OMP provider registers an `LlmAdapter` whose catalog is OMP's real
- * model registry. This module owns the source of that catalog.
+ * AVAILABLE model set. This module owns the source of that catalog.
  *
- * Source: the on-disk registry, because the authoritative `omp --mode rpc`
- * `get_available_models` response exceeds the 1 MiB RPC transport frame limit
- * for this install (~840 models with per-model compat/thinking metadata) and
- * so reliably fails with `RPC response exceeded the transport limit`.
+ * Source: `omp models --json` (first-party CLI, `omp-cli.ts`) — OMP's own
+ * credential-resolved availability verdict. The documented selectability
+ * rule (provider not in `disabledProviders` and keyless or with a
+ * resolvable credential) runs through a 7-level credential precedence that
+ * includes OAuth/login keys stored in agent.db — a state NO config file
+ * reveals, which is why the catalog must come from OMP itself.
  *
- *   1. `$OMP_HOME/agent/models.db` (`model_cache.models`, the on-disk cache the
- *      registry refreshes into) — the complete authoritative list.
- *   2. `$OMP_HOME/agent/models.yml` (the user overlay, e.g. `bailian`) — merged
- *      over the cache so user-declared providers that OMP never caches are
- *      still advertised.
- *
- * Both file sources are local and synchronous, which `registerAdapter` needs
- * (its provider list must be known synchronously to validate `providerInfo`).
+ * The authoritative RPC `get_available_models` would serve the same set but
+ * exceeds the 1 MiB transport frame limit for this install; the CLI returns
+ * the compact form (~50 models / 5 providers, 15 KB, ~1.7s). The on-disk
+ * `models.db` ∪ `models.yml` pair remains ONLY as the subprocess-failure
+ * fallback (registry-cache noise included) — never the primary.
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { ompAvailableModels, ompAvailableModelsSync, ompModelRolesSync } from "./omp-cli.js";
 import { ReasoningEffortId, type LlmModelInfo, type LlmResolvedModelInfo, type ModelModality } from "@deepseek-ai/dsh-llm";
 
 /** One model as OMP's registry describes it (`get_available_models` / model_cache / models.yml). */
@@ -42,31 +42,64 @@ export interface OmpModel {
 
 const OMP_AGENT_DIR = join(process.env.OMP_HOME ?? join(homedir(), ".omp"), "agent");
 
-/** Providers OMP's config.yml `modelRoles` actually names, listed first for a clean selector. */
-const PREFERRED_PROVIDERS = ["deepseek", "zai", "bailian"];
-
+/**
+ * Providers named by config.yml `modelRoles` lead the selector: they are the
+ * roles the operator actually wired (the TUI default-model semantics).
+ */
 let cached: OmpModel[] | null = null;
 
-/** Read the full merged OMP model catalog, memoized. */
+/**
+ * Read the AVAILABLE OMP model catalog, memoized. First call prefers the CLI
+ * (`omp models --json`, synchronous — the boot route list must be known
+ * before `registerAdapter` returns); a CLI failure falls back to the on-disk
+ * registry cache with a stderr note. Later refreshes go through
+ * `refreshOmpModelsCli` (async, per reconcile tick).
+ */
 export function loadOmpModels(): OmpModel[] {
-  if (cached === null) cached = mergeModels(loadModelsDb(), loadModelsYml());
+  if (cached === null) {
+    const cli = ompAvailableModelsSync();
+    if (cli !== undefined) {
+      cached = cli.map((model) => normalizeModel(model)).filter((model): model is OmpModel => model !== null);
+    } else {
+      process.stderr.write("[omp-provider] omp models --json unavailable; falling back to the on-disk model cache\n");
+      cached = mergeModels(loadModelsDb(), loadModelsYml());
+    }
+  }
   return cached;
 }
 
-/** The distinct provider ids across the catalog, in selector-friendly order. */
+/**
+ * Re-run the CLI catalog and swap the memo on success.
+ * @returns whether the refresh produced a fresh catalog.
+ */
+export async function refreshOmpModelsCli(): Promise<boolean> {
+  const cli = await ompAvailableModels();
+  if (cli === undefined) return false;
+  cached = cli.map((model) => normalizeModel(model)).filter((model): model is OmpModel => model !== null);
+  return true;
+}
+
+
+/** The distinct provider ids across the catalog, modelRoles roles first. */
 export function ompProviderIds(models: OmpModel[] = loadOmpModels()): string[] {
   const seen = new Set<string>();
   for (const model of models) seen.add(model.provider);
-  return [...seen].sort(
-    (a, b) => preferredRank(a) - preferredRank(b) || a.localeCompare(b),
-  );
+  const ordered: string[] = [];
+  // Providers the operator wired into modelRoles lead the selector (TUI
+  // semantics: the roles actually in use); everything else follows
+  // alphabetically.
+  for (const selector of Object.values(ompModelRolesSync() ?? {})) {
+    const slash = selector.indexOf("/");
+    const provider = slash > 0 ? selector.slice(0, slash) : "";
+    if (provider !== "" && seen.has(provider) && !ordered.includes(provider)) ordered.push(provider);
+  }
+  for (const provider of [...seen].sort((a, b) => a.localeCompare(b))) {
+    if (!ordered.includes(provider)) ordered.push(provider);
+  }
+  return ordered;
 }
 
-/** Preferred providers sort first; others keep their natural id order. */
-function preferredRank(provider: string): number {
-  const index = PREFERRED_PROVIDERS.indexOf(provider);
-  return index === -1 ? PREFERRED_PROVIDERS.length : index;
-}
+
 
 /** Human-readable provider name for `LlmProviderInfo.name`. */
 export function providerDisplayName(provider: string): string {

@@ -1,6 +1,6 @@
 {
   "name": "@pgmi-builds/omp-web",
-  "version": "0.2.0-a",
+  "version": "0.2.0-b",
   "description": "OMP Web: OMP provider for DeepSeek Harness (dsh) — an AgentFactory that spawns `omp --mode rpc` and bridges OMP's RPC stream into Dash Agent/Session contracts.",
   "repository": {
     "type": "git",

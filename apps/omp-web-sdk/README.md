@@ -51,3 +51,10 @@ dsh 宿主 (Node 22, 本包 dist/)            Bun sidecar (本包 sidecar/)
 - `extension_ui_response`（审批卡应答）在 SDK 线暂为 no-op：SDK 侧审批走 `autoApprove`/approval 事件，卡片化审批的等价通道待接。
 - `getSubagents` 暂返回 `[]`（SDK 的 subagent registry 暴露面待查）。
 - 未跑 4999 全链路（dsh 宿主内 provider 挂载）——下一步。
+
+## As-built：4999 全链路冒烟（2026-09-09，PASS ✅）
+
+- test profile `omp-web-test` 切换 dep 至 `link:…/apps/omp-web-sdk`（bundle 位同步换 `@pgmi-builds/omp-web-sdk`，patch 语义同 omp-web：mount omp-provider + 禁 agent-loop/llm 路由/agent-presets）。
+- systemd-run `omp-web-4999-test`（DSH_HOME=~/.omp/omp-web、OMP_HOME=~/.omp、port 4999）拉起全局 dsh 0.1.3-alpha.2，unit active。
+- 验证链：auth 200 → `session/create` ok → **dsh 进程树内 1 个共享 bun sidecar** → `session/prompt`（mode:queue + requestId，typert request 形状）accepted → `session/page`（`records[].event`，`throughSeq ≤ cursor`）回读：turn/start、user/message、2×step（reasoning + `think` 工具调用 + tool/result）、assistant/message（text "sdk-line-alive"，xai/grok-4.6，含 stream chunks）、turn/end。
+- wire 备忘：`session/prompt` 必填 `requestId`/`mode`/`content`；`session/page` 用 `args.request`（非 `_request`），`address:{kind:"session",sessionId}` + `throughSeq` 超 cursor 直接报错并回吐当前 cursor。

@@ -1,0 +1,63 @@
+# @pgmi-builds/omp-web-sdk bundle patch. This file is the `dsh.bundle.patch` layer
+# of the published npm package: when installed via
+#
+#   dsh plugin --profile <name> add @pgmi-builds/omp-web-sdk
+#
+# the profile boot merges THIS patch — mount the OMP provider plus disable the
+# native components OMP replaces — exactly like a manual cordis.patch.yml.
+# No profile file edits needed: one command installs and mounts.
+#
+# Profile-specific values are deliberately NOT here: `webserver.port` (port
+# choice) and `settings.path` (settings-under-profile) belong to the user's
+# profile patch layer; `agent-default-model` is tracked dynamically by the
+# bridge from OMP's config.yml (`modelRoles.default`).
+
+# Mount the OMP provider: a Cordis Service that registers an AgentFactory on
+# ctx.agents. The provider bridges the full RPC surface (prompt/follow_up/steer/
+# abort/get_state/get_messages/set_model) plus resume; the model selector is
+# served by an OMP-backed LlmAdapter.
+- insert:
+    - id: omp-provider
+      name: '@pgmi-builds/omp-web-sdk'
+
+# OMP owns the live agent transcript; disable the built-in loop so it does not
+# double-run alongside the OMP RPC process.
+- id: agent-loop
+  disabled: true
+
+# The native routes register deepseek-official / pi-ai providers; the OMP
+# provider registers its own adapter (one route per OMP provider) on ctx.llm.
+# Leaving them mounted would advertise native models alongside OMP's.
+- id: llm-deepseek
+  disabled: true
+- id: llm-pi-ai
+  disabled: true
+
+# OMP is single-mode: its own RPC process drives tools, so no Dash preset
+# composition is needed.
+- id: agent-presets
+  disabled: true
+
+# The stock jsonl row is unmounted; the omp-provider plugin itself provides
+# `sessionPersistence` (union of JSONL + OMP native store scan).
+- id: session-persistence-jsonl
+  disabled: true
+
+# OMP has no runtime approval control — the bridge maps the preset onto omp's
+# launch-only --approval-mode flag. Default to danger-full-access (OMP's own
+# native yolo default). Restate the full 3-preset table: a patch with only
+# defaultPreset silently drops the bundle's 3-preset table to the plugin's
+# built-in 2, breaking the 3:3 Dash<->OMP pairing.
+- id: permission
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+    defaultPreset: danger-full-access

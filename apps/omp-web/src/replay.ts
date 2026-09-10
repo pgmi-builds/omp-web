@@ -13,7 +13,7 @@
  * The emitted events carry contiguous `seq` from 0 and safe-integer `time`
  * values, exactly what `Session`'s seed validator requires.
  */
-import { ToolCallId, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { ToolCallId, createAssistantMessage, createSystemMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionSeq, type SessionEvent, type TurnEndReason } from "@deepseek-ai/dsh-session";
 import type { OmpMessage } from "./rpc-types.js";
 import { convertContent, convertUsage, ompFailure } from "./agent.js";
@@ -164,6 +164,16 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
  * system prompt (`systemPrompt`), followed by the message replay,
  * with contiguous `seq` renumbered from 0.
  */
+/** One synthesized `system/message` surface node (surface node 0) carrying the rendered OMP system prompt. */
+function systemMessageEvent(systemPrompt: string, time: number): SessionEvent {
+  return {
+    type: "system/message",
+    seq: 0,
+    time,
+    data: { turn: 0, step: 0, message: createSystemMessage(systemPrompt, "omp-web") },
+  } as unknown as SessionEvent;
+}
+
 export function replayOmpTranscript(
   messages: OmpMessage[],
   title?: string,
@@ -173,14 +183,23 @@ export function replayOmpTranscript(
 ): SessionEvent[] {
   const replayed = replayOmpMessages(messages);
   const config = lastRestorableModel(modelChanges ?? []) ?? lastModelCall(messages);
+  const baseTime = replayed[0]?.time ?? Date.now();
+  // The 0.1.5 surface contract forbids `header.system` on `request/header`
+  // (surface.ts throws); the system prompt rides its own `system/message` node.
+  const systemNode = systemPrompt === undefined ? [] : [systemMessageEvent(systemPrompt, baseTime)];
   if (title === undefined || title.length === 0) {
-    if (config === undefined) return replayed;
+    if (config === undefined) {
+      return systemNode.length === 0
+        ? replayed
+        : [...systemNode, ...replayed].map((event, index) => ({ ...event, seq: SessionSeq(index) }));
+    }
     return [
+      ...systemNode,
       {
         type: "request/header",
         seq: 0,
-        time: replayed[0]?.time ?? Date.now(),
-        data: { header: { config, ...(systemPrompt ? { system: systemPrompt } : {}) }, reason: "resume" },
+        time: baseTime,
+        data: { header: { config }, reason: "resume" },
       } as unknown as SessionEvent,
       ...replayed,
     ].map((event, index) => ({ ...event, seq: SessionSeq(index) }));
@@ -189,17 +208,18 @@ export function replayOmpTranscript(
     {
       type: "session/title",
       seq: 0,
-      time: titleTime ?? replayed[0]?.time ?? Date.now(),
+      time: titleTime ?? baseTime,
       data: { title, messageSeqs: [], source: { kind: "user" } },
     } as unknown as SessionEvent,
+    ...systemNode,
     ...(config === undefined
       ? []
       : [
           {
             type: "request/header",
             seq: 0,
-            time: titleTime ?? replayed[0]?.time ?? Date.now(),
-            data: { header: { config, ...(systemPrompt ? { system: systemPrompt } : {}) }, reason: "resume" },
+            time: titleTime ?? baseTime,
+            data: { header: { config }, reason: "resume" },
           } as unknown as SessionEvent,
         ]),
     ...replayed,

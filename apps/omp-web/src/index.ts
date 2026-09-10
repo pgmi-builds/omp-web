@@ -33,6 +33,7 @@ import type {
 import { emitAgentEvent } from "@deepseek-ai/dsh-agent";
 import { SessionPreparation, type Session, type SessionEvent, type SessionId } from "@deepseek-ai/dsh-session";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
+import { createSystemMessage } from "@deepseek-ai/dsh-llm";
 import { OmpSdkClient } from "./sdk-client.js";
 import { OmpAgent } from "./agent.js";
 import { replayOmpMessages } from "./replay.js";
@@ -601,6 +602,17 @@ async function setupAndPublish(
     // promoted shadow the session is already entered+announced; enterSession
     // is false and the projection is reused (seq-continuous promotion).
     agent = new OmpAgent(loopCtx, id, agentOptions, session, rpc, () => idleExit?.());
+
+    // Surface node 0: stamp the live system prompt for a FRESH session (the
+    // 0.1.5 contract forbids `header.system` on request/header). Fail-soft —
+    // a replayed/resumed session already seeds its own `system/message`.
+    if (!session.snapshotEvents().some((event) => event.type === "system/message")) {
+      const liveSystemPrompt = await rpc.getSystemPrompt();
+      if (liveSystemPrompt !== undefined && liveSystemPrompt !== "") {
+        session.append("system/message", { turn: 0, step: 0, message: createSystemMessage(liveSystemPrompt, "omp-web") }, { surfaceOp: "append" });
+      }
+    }
+
 
     // Composition-only setup on the unpublished agent scope.
     const commit = await setup?.(agent.ctx, agent);

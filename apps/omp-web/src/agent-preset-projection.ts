@@ -30,7 +30,10 @@ const agentPresetSchema = z.union([z.string(), z.null()]);
 export const ompAgentPresetProjection = {
   key: "agentPreset",
   stateSchema: agentPresetSchema,
-  init: (header) => (header as { agentPreset?: string }).agentPreset ?? null,
+  // omp-web is single-preset: default every session to "omp" so the header
+  // chip resolves for scan-native (never-resumed) sessions too, instead of
+  // only those whose log carries an `agent-preset/selected` event.
+  init: (header) => (header as { agentPreset?: string }).agentPreset ?? "omp",
   apply: (state, event) =>
     event.type === "agent-preset/selected"
       ? (event.data as { agentPreset: string }).agentPreset

@@ -44,16 +44,18 @@ test("missing timestamps fall back to a monotonic now-base", () => {
   assert.ok(events[0].time > 0);
 });
 
-test("replayOmpTranscript writes systemPrompt into request/header system", () => {
+test("replayOmpTranscript emits system prompt as a system/message node (0.1.5 surface contract)", () => {
   const modelChanges = [{ model: "deepseek/deepseek-v4-pro", role: "default" }];
   const events = replayOmpTranscript([], undefined, undefined, modelChanges, "RENDERED SYSTEM PROMPT");
+  const systemNode = events.find((e) => e.type === "system/message");
+  assert.ok(systemNode !== undefined, "system/message present");
+  assert.equal(systemNode.data.message.role, "system");
+  assert.ok(systemNode.data.message.content.some((b) => b.type === "text" && b.text === "RENDERED SYSTEM PROMPT"), "system text carried");
   const header = events.find((e) => e.type === "request/header");
   assert.ok(header !== undefined, "request/header present");
   assert.equal(header.data.reason, "resume");
-  assert.equal(header.data.header.system, "RENDERED SYSTEM PROMPT");
-  // absent when no system prompt is supplied (backwards-compatible shape)
+  assert.equal(header.data.header.system, undefined, "header must omit system (0.1.5 contract)");
+  // absent when no system prompt is supplied
   const bare = replayOmpTranscript([], undefined, undefined, modelChanges);
-  const bareHeader = bare.find((e) => e.type === "request/header");
-  assert.ok(bareHeader !== undefined);
-  assert.equal(bareHeader.data.header.system, undefined);
+  assert.equal(bare.find((e) => e.type === "system/message"), undefined);
 });

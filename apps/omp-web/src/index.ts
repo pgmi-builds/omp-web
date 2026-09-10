@@ -51,6 +51,7 @@ import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEv
 import { closeBridgeStore, getBridgeStore, initBridgeStore } from "./store/index.js";
 import { reconcileOnce, syncSessionHeader, upsertCreated } from "./store/reconcile.js";
 import { installMobileBootScript } from "./mobile-boot.js";
+import { installOmpDiscovery } from "./discovery.js";
 
 /** Bounded grace for avoidance hand-off: abort then wait this long before forced teardown. */
 const AVOIDANCE_GRACE_MS = 10_000;
@@ -175,6 +176,8 @@ export class OmpProvider extends Service implements AgentFactory {
     // + the iOS zoom-guard section. Fail-open — a missing webServer leaves the
     // feature dormant, and an injection failure is logged, never thrown.
     installMobileBootScript(ctx);
+    // OMP skills + slash commands into the host's `skills`/`commands` seams.
+    installOmpDiscovery(ctx);
   }
 
   /**

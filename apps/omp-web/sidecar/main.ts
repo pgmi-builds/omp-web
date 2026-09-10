@@ -12,7 +12,7 @@
  * (newSession / switchSession / fork) mint a NEW OMP session id while the
  * bridge-side handle must stay stable for the lifetime of the client.
  */
-import { createAgentSession, SessionManager, discoverAuthStorage, ModelRegistry, Settings, loadSessionMessagesReadOnly, parseSessionEntries } from "@oh-my-pi/pi-coding-agent";
+import { createAgentSession, SessionManager, discoverAuthStorage, ModelRegistry, Settings, loadSessionMessagesReadOnly, parseSessionEntries, discoverSkills, discoverSlashCommands, AgentRegistry } from "@oh-my-pi/pi-coding-agent";
 import { PROTOCOL_VERSION, type EventFrame, type RequestFrame, type ResponseFrame } from "../dist/protocol.js";
 
 // ---------- outbound ----------
@@ -256,7 +256,40 @@ const table: Record<string, Handler> = {
   },
 
   // get_subagents parity — SDK subagent registry exposure TBD; fail-soft.
-  "session.subagents": async () => ({ subagents: [] }),
+  // Subagent registry: enumerate the session's own subagents (kind === "sub"
+  // with parentId === this session's registry id). The sidecar's per-session
+  // registry would give a faithful tree; the global registry is the fallback.
+  "session.subagents": async ({ handle }: any) => {
+    const session: any = await get(handle);
+    const myId = session.getAgentId?.();
+    const subagents = AgentRegistry.global().list()
+      .filter((r: any) => r.kind === "sub" && (myId === undefined || r.parentId === myId))
+      .map((r: any) => ({
+        id: r.id, displayName: r.displayName, parentId: r.parentId, kind: r.kind,
+        status: r.status, sessionFile: r.sessionFile, cwd: r.session?.cwd,
+        createdAt: r.createdAt, lastActivity: r.lastActivity, activity: r.activity,
+      }));
+    return { subagents };
+  },
+
+  // Skills + slash commands from OMP's extensibility store (fail-soft).
+  "skills.list": async ({ cwd }: any) => {
+    try {
+      const { skills } = await discoverSkills(cwd);
+      return { skills: skills.map((s: any) => ({ name: s.name, description: s.description, filePath: s.filePath, baseDir: s.baseDir, source: s.source })) };
+    } catch {
+      return { skills: [] };
+    }
+  },
+
+  "slashCommands.list": async ({ cwd }: any) => {
+    try {
+      const commands = await discoverSlashCommands(cwd);
+      return { commands: commands.map((c: any) => ({ name: c.name, description: c.description, content: c.content, source: c.source })) };
+    } catch {
+      return { commands: [] };
+    }
+  },
 
   "session.prompt": async ({ handle, text, streamingBehavior }: any) => {
     const session = await get(handle);

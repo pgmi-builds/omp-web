@@ -110,6 +110,44 @@ export async function renderSystemPromptForFile(file: string): Promise<string | 
 }
 
 // ---------------------------------------------------------------------------
+
+/** One OMP skill's discovery metadata (name/description + body location). */
+export interface OmpSkill {
+  name: string;
+  description: string;
+  filePath: string;
+  baseDir: string;
+  source: string;
+}
+
+/** One OMP slash command's discovery metadata. */
+export interface OmpSlashCommand {
+  name: string;
+  description: string;
+  content: string;
+  source: string;
+}
+
+/** Discover OMP skills for a workspace (fail-soft: [] on sidecar error). */
+export async function listSkills(cwd?: string): Promise<OmpSkill[]> {
+  try {
+    const data = await callShared<{ skills?: OmpSkill[] }>("skills.list", { cwd });
+    return data?.skills ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** Discover OMP slash commands for a workspace (fail-soft: [] on sidecar error). */
+export async function listSlashCommands(cwd?: string): Promise<OmpSlashCommand[]> {
+  try {
+    const data = await callShared<{ commands?: OmpSlashCommand[] }>("slashCommands.list", { cwd });
+    return data?.commands ?? [];
+  } catch {
+    return [];
+  }
+}
+// ---------------------------------------------------------------------------
 export class OmpSdkClient {
   readonly #sidecar: OmpSdkSidecar;
   readonly #handle: string;

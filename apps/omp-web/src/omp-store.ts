@@ -11,7 +11,9 @@
 import { closeSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import type { OmpMessage } from "./rpc.js";
+import type { OmpMessage } from "./rpc-types.js";
+import { callShared } from "./sdk-client.js";
+import type { methods } from "./protocol.js";
 
 /** One OMP-native session discovered by {@link scanOmpSessions}. */
 export interface OmpNativeSession {
@@ -113,6 +115,59 @@ export function readOmpTranscript(path: string): OmpTranscript {
     }
   }
   return { messages, modelChanges };
+}
+
+/** Memoized SDK transcript reads, keyed by file + (size, mtime). */
+const transcriptSdkCache = new Map<string, { size: number; mtimeMs: number; value: OmpTranscript }>();
+
+/**
+ * Read one OMP transcript through the shared sidecar's SDK reader
+ * (`loadSessionMessagesReadOnly` + a lenient `model_change` recovery), memoized
+ * on (size, mtime). Returns `undefined` on any sidecar/SDK failure so callers
+ * fall back to {@link readOmpTranscript} — fail-soft, never blocking replay.
+ */
+export async function readOmpTranscriptSdk(path: string): Promise<OmpTranscript | undefined> {
+  let size: number;
+  let mtimeMs: number;
+  try {
+    const stats = statSync(path);
+    size = stats.size;
+    mtimeMs = stats.mtimeMs;
+  } catch {
+    return undefined;
+  }
+  const cached = transcriptSdkCache.get(path);
+  if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs) return cached.value;
+  try {
+    const data = await callShared<methods.SessionsMessagesReadOnlyResult>("sessions.messagesReadOnly", { file: path });
+    const messages: OmpMessage[] = [];
+    const rawMessages = (data as { messages?: unknown } | null)?.messages;
+    if (Array.isArray(rawMessages)) {
+      for (const message of rawMessages) {
+        if (message === null || typeof message !== "object") continue;
+        const msg = message as Record<string, unknown>;
+        const role = msg["role"];
+        if (role !== "user" && role !== "assistant" && role !== "toolResult") continue;
+        messages.push({ ...msg, role } as OmpMessage);
+      }
+    }
+    const modelChanges: OmpModelChange[] = [];
+    const rawChanges = (data as { modelChanges?: unknown } | null)?.modelChanges;
+    if (Array.isArray(rawChanges)) {
+      for (const change of rawChanges) {
+        if (change === null || typeof change !== "object") continue;
+        const c = change as Record<string, unknown>;
+        const model = c["model"];
+        if (typeof model !== "string" || model === "") continue;
+        modelChanges.push({ model, role: typeof c["role"] === "string" ? c["role"] : undefined });
+      }
+    }
+    const value: OmpTranscript = { messages, modelChanges };
+    transcriptSdkCache.set(path, { size, mtimeMs, value });
+    return value;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -336,10 +391,80 @@ export function sessionHeaderId(path: string): string | undefined {
 }
 
 /**
+ * One SDK-derived session-index entry (stable metadata only — size/mtime are
+ * re-stat'd fresh by the caller so change detection is never snapshot-stale).
+ */
+interface SdkIndexEntry {
+  id: string;
+  cwd?: string;
+  title?: string;
+  createdAt: number;
+}
+
+/** Latest successful SDK `sessions.listAll` snapshot, keyed by session file. */
+let sdkIndexByFile: Map<string, SdkIndexEntry> | undefined;
+let sdkIndexFetch: Promise<void> | null = null;
+
+/** Fetch the full-library index from the shared sidecar (fail-soft). */
+async function refreshSdkIndex(): Promise<void> {
+  try {
+    const data = await callShared<methods.SessionsListAllResult>("sessions.listAll", {});
+    const sessions = (data as { sessions?: unknown } | null)?.sessions;
+    if (!Array.isArray(sessions)) {
+      sdkIndexByFile = undefined;
+      return;
+    }
+    const map = new Map<string, SdkIndexEntry>();
+    for (const item of sessions) {
+      if (item === null || typeof item !== "object") continue;
+      const s = item as Record<string, unknown>;
+      const id = s["id"];
+      const file = s["file"];
+      if (typeof id !== "string" || id === "" || typeof file !== "string" || file === "") continue;
+      const cwd = typeof s["cwd"] === "string" && s["cwd"] !== "" ? s["cwd"] : undefined;
+      const title = typeof s["title"] === "string" && s["title"] !== "" ? s["title"] : undefined;
+      const firstMessage = typeof s["firstMessage"] === "string" ? s["firstMessage"] : undefined;
+      const createdAtRaw = s["createdAt"];
+      const createdAt =
+        typeof createdAtRaw === "number" && Number.isSafeInteger(createdAtRaw) && createdAtRaw > 0
+          ? createdAtRaw
+          : (createdAtFromFileName(basename(file)) ?? 0);
+      const resolvedTitle = title ?? (firstMessage === undefined ? undefined : fallbackTitle(firstMessage));
+      map.set(file, {
+        id,
+        ...(cwd === undefined ? {} : { cwd }),
+        ...(resolvedTitle === undefined ? {} : { title: resolvedTitle }),
+        createdAt,
+      });
+    }
+    sdkIndexByFile = map;
+  } catch {
+    sdkIndexByFile = undefined;
+  }
+}
+
+/** Kick off one SDK index refresh if none is in flight (no redundant spawn). */
+function ensureSdkIndexWarm(): void {
+  if (sdkIndexFetch === null) {
+    sdkIndexFetch = refreshSdkIndex().finally(() => {
+      sdkIndexFetch = null;
+    });
+  }
+}
+
+/**
  * Scan OMP's native store. Returns sessions keyed by OMP session id; files
  * without a parsable `session` header record are skipped (corrupt/foreign).
+ *
+ * The FILE LIST always comes from a fresh directory walk (so prune/diff never
+ * act on a stale snapshot); the rich per-session metadata (id/cwd/title/
+ * createdAt) is served from the SDK's full-library `listAll` when available,
+ * with the self-written {@link scanHead} as the fallback for files the snapshot
+ * does not yet know (or when the sidecar is down).
  */
 export function scanOmpSessions(): Map<string, OmpNativeSession> {
+  ensureSdkIndexWarm();
+  const sdk = sdkIndexByFile;
   const sessions = new Map<string, OmpNativeSession>();
   let workspaceDirs: string[];
   try {
@@ -369,31 +494,47 @@ export function scanOmpSessions(): Map<string, OmpNativeSession> {
         entryCache.delete(path);
         continue;
       }
-      let cached = entryCache.get(path);
-      if (cached === undefined || cached.size !== size || cached.mtimeMs !== mtimeMs) {
-        const head = scanHead(path);
-        const entry: OmpNativeSession | undefined =
-          head.ompSessionId === undefined
-            ? undefined
-            : {
-                ompSessionId: head.ompSessionId,
-                ompSessionFile: path,
-                size,
-                mtimeMs,
-                ...(head.cwd === undefined ? {} : { cwd: head.cwd }),
-                createdAt: head.createdAt ?? createdAtFromFileName(fileName) ?? 0,
-                ...(head.title !== undefined
-                  ? { title: head.title }
-                  : head.firstUserText !== undefined
-                    ? { title: fallbackTitle(head.firstUserText) }
-                    : {}),
-                revision: `omp:${size}:${mtimeMs}`,
-              };
-        cached = { size, mtimeMs, entry };
-        entryCache.set(path, cached);
+      const sdkEntry = sdk?.get(path);
+      let entry: OmpNativeSession | undefined;
+      if (sdkEntry !== undefined) {
+        entry = {
+          ompSessionId: sdkEntry.id,
+          ompSessionFile: path,
+          size,
+          mtimeMs,
+          ...(sdkEntry.cwd === undefined ? {} : { cwd: sdkEntry.cwd }),
+          createdAt: sdkEntry.createdAt,
+          ...(sdkEntry.title === undefined ? {} : { title: sdkEntry.title }),
+          revision: `omp:${size}:${mtimeMs}`,
+        };
+      } else {
+        let cached = entryCache.get(path);
+        if (cached === undefined || cached.size !== size || cached.mtimeMs !== mtimeMs) {
+          const head = scanHead(path);
+          const parsed: OmpNativeSession | undefined =
+            head.ompSessionId === undefined
+              ? undefined
+              : {
+                  ompSessionId: head.ompSessionId,
+                  ompSessionFile: path,
+                  size,
+                  mtimeMs,
+                  ...(head.cwd === undefined ? {} : { cwd: head.cwd }),
+                  createdAt: head.createdAt ?? createdAtFromFileName(fileName) ?? 0,
+                  ...(head.title !== undefined
+                    ? { title: head.title }
+                    : head.firstUserText !== undefined
+                      ? { title: fallbackTitle(head.firstUserText) }
+                      : {}),
+                  revision: `omp:${size}:${mtimeMs}`,
+                };
+          cached = { size, mtimeMs, entry: parsed };
+          entryCache.set(path, cached);
+        }
+        entry = cached.entry;
       }
-      if (cached.entry !== undefined && !sessions.has(cached.entry.ompSessionId)) {
-        sessions.set(cached.entry.ompSessionId, cached.entry);
+      if (entry !== undefined && !sessions.has(entry.ompSessionId)) {
+        sessions.set(entry.ompSessionId, entry);
       }
     }
   }

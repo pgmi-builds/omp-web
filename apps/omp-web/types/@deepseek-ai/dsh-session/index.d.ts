@@ -15,7 +15,7 @@ import type { SessionSurface } from './surface.ts';
 export * from './types.ts';
 export { SessionPreparation } from './preparation.ts';
 export type { SessionPreparationOptions } from './preparation.ts';
-export type { AssistantMessage, ToolResultMessage, UserMessage } from '@deepseek-ai/dsh-llm';
+export type { AssistantMessage, SystemMessage, ToolResultMessage, UserMessage } from '@deepseek-ai/dsh-llm';
 export { interruptedTurnClosers, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from './repair.ts';
 export type { SessionSurface, SurfaceFoldReplacement, SurfaceFoldResult } from './surface.ts';
 export { deriveEventMessage, foldSurface, isAppendSurfaceEvent, isReplacementSurfaceEvent, isSurfaceEvent, isSurfaceEligibleType } from './surface.ts';
@@ -83,6 +83,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
  * Use {@link snapshotSessionEvent} when exclusive ownership is not guaranteed.
  * @param event - exclusively owned event imported across a trusted boundary.
  * @returns the same event object with a validated, deeply frozen message.
+ * @throws when event-local surface metadata, request-header fields, or message invariants are invalid; history relations are not checked.
  */
 export declare function adoptSessionEvent<T extends SessionEvent>(event: T): T;
 /**
@@ -223,6 +224,7 @@ export declare class Session {
      *   (BigInt, function, symbol, undefined, negative zero, non-finite number,
      *   circular reference, sparse array, or an exotic object such as
      *   Map/Set/Date/class instance), or when the candidate violates the
+     *   request-header empty-field or tool-error consistency rules, or the
      *   canonical surface contract (marker shape and eligibility, unique
      *   earlier source-event references, positional replacement validity, and complete
      *   shadowed-node coverage). One iterative pass reads, validates, and

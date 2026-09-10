@@ -24,7 +24,7 @@ const OMP_PRESET: AgentPreset = Object.freeze({
   trust: "system",
   path: "",
   name: "OMP",
-  description: "A single OMP agent session; the composition is owned by the OMP provider.",
+  description: "OMP agent via the omp-web bridge",
 });
 
 const COMPOSITION_TEXT = [
@@ -131,12 +131,20 @@ export class SingleOmpPresetRoster extends TypertRemoteService {
     return preset.id;
   }
 
-  async copy(_from: string, _id: string, _name?: string): Promise<void> {
-    throw new Error("the OMP roster is fixed: it ships exactly one preset and cannot be authored");
+  async copy(_from: string, id: string, _name?: string): Promise<void> {
+    throw new RemoteError(
+      "agent-preset/read-only",
+      `agent-presets: preset "${id}" cannot be written: the OMP roster is fixed and ships exactly one preset`,
+      { agentPreset: id, reason: "the OMP roster is fixed and ships exactly one preset" },
+    );
   }
 
-  async remove(_id: string): Promise<void> {
-    throw new Error("the OMP roster is fixed: it ships exactly one preset and cannot be authored");
+  async remove(id: string): Promise<void> {
+    throw new RemoteError(
+      "agent-preset/read-only",
+      `agent-presets: preset "${id}" cannot be written: the OMP roster is fixed and ships exactly one preset`,
+      { agentPreset: id, reason: "the OMP roster is fixed and ships exactly one preset" },
+    );
   }
 
   serviceFor(_agent: { ctx: Context }, _name: string): undefined {

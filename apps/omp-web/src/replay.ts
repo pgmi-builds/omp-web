@@ -15,7 +15,7 @@
  */
 import { ToolCallId, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionSeq, type SessionEvent, type TurnEndReason } from "@deepseek-ai/dsh-session";
-import type { OmpMessage } from "./rpc.js";
+import type { OmpMessage } from "./rpc-types.js";
 import { convertContent, convertUsage, ompFailure } from "./agent.js";
 import { lastModelCall, lastRestorableModel, type OmpModelChange } from "./omp-store.js";
 
@@ -160,7 +160,8 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
  * leading `session/title` event (so the sidebar title projection folds
  * immediately, pinned `user`-sourced so Dash's own generator never fights
  * OMP's title authority), a `request/header` event carrying the transcript's
- * last model (see {@link lastModelCall}), followed by the message replay,
+ * last model (see {@link lastModelCall}) and, when supplied, its rendered
+ * system prompt (`systemPrompt`), followed by the message replay,
  * with contiguous `seq` renumbered from 0.
  */
 export function replayOmpTranscript(
@@ -168,6 +169,7 @@ export function replayOmpTranscript(
   title?: string,
   titleTime?: number,
   modelChanges?: OmpModelChange[],
+  systemPrompt?: string,
 ): SessionEvent[] {
   const replayed = replayOmpMessages(messages);
   const config = lastRestorableModel(modelChanges ?? []) ?? lastModelCall(messages);
@@ -178,7 +180,7 @@ export function replayOmpTranscript(
         type: "request/header",
         seq: 0,
         time: replayed[0]?.time ?? Date.now(),
-        data: { header: { config }, reason: "resume" },
+        data: { header: { config, ...(systemPrompt ? { system: systemPrompt } : {}) }, reason: "resume" },
       } as unknown as SessionEvent,
       ...replayed,
     ].map((event, index) => ({ ...event, seq: SessionSeq(index) }));
@@ -197,7 +199,7 @@ export function replayOmpTranscript(
             type: "request/header",
             seq: 0,
             time: titleTime ?? replayed[0]?.time ?? Date.now(),
-            data: { header: { config }, reason: "resume" },
+            data: { header: { config, ...(systemPrompt ? { system: systemPrompt } : {}) }, reason: "resume" },
           } as unknown as SessionEvent,
         ]),
     ...replayed,

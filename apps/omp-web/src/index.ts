@@ -22,6 +22,7 @@ import { Context, Service } from "@deepseek-ai/cordis";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
+  Agent,
   AgentFactory,
   AgentHandle,
   AgentOptions,
@@ -32,12 +33,13 @@ import type {
 import { emitAgentEvent } from "@deepseek-ai/dsh-agent";
 import { SessionPreparation, type Session, type SessionEvent, type SessionId } from "@deepseek-ai/dsh-session";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
-import { OmpRpcClient } from "./rpc.js";
+import { OmpSdkClient } from "./sdk-client.js";
 import { OmpAgent } from "./agent.js";
 import { replayOmpMessages } from "./replay.js";
 import { OmpLlmAdapter } from "./adapter.js";
 import { OmpUnionSessionPersistence } from "./session-persistence-omp.js";
 import { SingleOmpPresetRoster } from "./agent-preset-omp.js";
+import { ompAgentPresetProjection } from "./agent-preset-projection.js";
 import { resolveEntryById } from "./pairing.js";
 import { cwdFromSessionFile, foreignWriterPid, OMP_SESSIONS_ROOT, parseSelector as parseModelSelector, sessionHeaderId } from "./omp-store.js";
 import { supervisor } from "./supervisor.js";
@@ -47,6 +49,7 @@ import { STORAGE_RECONCILE_INTERVAL_MS } from "./knobs.js";
 import { defaultPermissionPreset, envApprovalMode, ompApprovalMode, presetFromEvents } from "./permission.js";
 import { closeBridgeStore, getBridgeStore, initBridgeStore } from "./store/index.js";
 import { reconcileOnce, syncSessionHeader, upsertCreated } from "./store/reconcile.js";
+import { installMobileBootScript } from "./mobile-boot.js";
 
 /** Bounded grace for avoidance hand-off: abort then wait this long before forced teardown. */
 const AVOIDANCE_GRACE_MS = 10_000;
@@ -144,6 +147,14 @@ export class OmpProvider extends Service implements AgentFactory {
     // this plugin's own (top-level) fiber instead — its Service constructor
     // ties teardown to this fiber via reflect.provide.
     new SingleOmpPresetRoster(ctx);
+    // Drive the `agentPreset` session projection ourselves: the upstream
+    // registrant lives in the (disabled) dsh-agent-presets package, but the
+    // Web UI gates the preset chip and header label on
+    // `projectionValues.agentPreset`. Deferred via inject so the registry's
+    // service contract is honored (registers only once it exists).
+    ctx.inject(["sessionProjections"], (scoped: Context) => {
+      scoped.sessionProjections.register(ompAgentPresetProjection);
+    });
     // Session supervisor: state machine + cold projection + foreign detection.
     // `ctx.logger` output is not captured by the systemd journal in this
     // profile; supervisor events are load-bearing (avoidance), so mirror them
@@ -159,6 +170,10 @@ export class OmpProvider extends Service implements AgentFactory {
     ctx.effect(() => () => this.stopFollow(), "ompProvider.followStop()");
     ctx.effect(() => () => closeBridgeStore(), "ompProvider.storeClose()");
     this.#reconcileWorkspaces();
+    // Mobile page-config boot script (host half): sets `window.__OMP_WEB_MOBILE__`
+    // + the iOS zoom-guard section. Fail-open — a missing webServer leaves the
+    // feature dormant, and an injection failure is logged, never thrown.
+    installMobileBootScript(ctx);
   }
 
   /**
@@ -332,7 +347,7 @@ export class OmpProvider extends Service implements AgentFactory {
     trace(`create id=${id} preset=${preset ?? "none"} approval-mode=${approvalMode}${envMode === undefined ? "" : " (env override)"}`);
 
     // Spawn OMP and wait for the `ready` handshake.
-    const rpc = await OmpRpcClient.spawn(["--approval-mode", approvalMode], cwd);
+    const rpc = await OmpSdkClient.spawn(["--approval-mode", approvalMode], cwd);
 
     try {
       // The Dash session id and OMP's session id are UNRELATED (Dash mints
@@ -369,7 +384,7 @@ export class OmpProvider extends Service implements AgentFactory {
         }
       }
 
-      const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation.session, rpc, "startup", { enterSession: true, preparation });
+      const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation.session, rpc, options.parentAgent, "startup", { enterSession: true, preparation });
 
       return this.registerHeld(id, state.sessionFile ?? "", handle);
     } catch (error) {
@@ -468,7 +483,7 @@ export class OmpProvider extends Service implements AgentFactory {
 
     // Re-attach to the OMP session by its persisted file (OMP owns the live
     // agent transcript and keeps generating it from here on).
-    const rpc = await OmpRpcClient.spawn(["--approval-mode", approvalMode, "--resume", sessionFile], spawnCwd);
+    const rpc = await OmpSdkClient.spawn(["--approval-mode", approvalMode, "--resume", sessionFile], spawnCwd);
 
     // L3: TOCTOU closer — a TUI may have opened the file in the spawn window.
     const postHolder = foreignWriterPid(sessionFile);
@@ -482,7 +497,7 @@ export class OmpProvider extends Service implements AgentFactory {
       const shadowSession = supervisor.shadowSessionOf(id);
       if (shadowSession !== undefined) {
         trace(`resume id=${id} promoting shadow session`);
-        const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, shadowSession, rpc, "resume", { enterSession: false });
+        const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, shadowSession, rpc, options.parentAgent, "resume", { enterSession: false });
         return this.registerHeld(id, sessionFile, handle);
       }
 
@@ -511,7 +526,7 @@ export class OmpProvider extends Service implements AgentFactory {
       if (resumeStore !== undefined) syncSessionHeader(resumeStore, String(id), preparation.session.header);
       trace(`resume id=${id} replayed transcript from OMP store`);
 
-      const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation.session, rpc, "resume", { enterSession: true, preparation });
+      const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation.session, rpc, options.parentAgent, "resume", { enterSession: true, preparation });
       return this.registerHeld(id, sessionFile, handle);
     } catch (error) {
       trace(`resume ${id} THREW: ${String(error)} | stack=${error instanceof Error ? error.stack?.slice(0, 400) : "n/a"}`);
@@ -570,7 +585,8 @@ async function setupAndPublish(
   agentOptions: AgentOptions,
   setup: AgentSetup | undefined,
   session: Session,
-  rpc: OmpRpcClient,
+  rpc: OmpSdkClient,
+  parentAgent: Agent | undefined,
   source: "startup" | "resume",
   opts: { enterSession: boolean; preparation?: SessionPreparation },
 ): Promise<AgentHandle> {
@@ -587,7 +603,7 @@ async function setupAndPublish(
     agent = new OmpAgent(loopCtx, id, agentOptions, session, rpc, () => idleExit?.());
 
     // Composition-only setup on the unpublished agent scope.
-    const commit = await setup?.(agent.ctx);
+    const commit = await setup?.(agent.ctx, agent);
 
     // Publish: enter both session and agent, announce in order, then signal
     // session-start. The commit runs immediately before publication.
@@ -597,7 +613,7 @@ async function setupAndPublish(
       detachSession = agent.ctx.sessions.enter(session);
       agent.ctx.sessions.announce(session);
     }
-    detachAgent = loopCtx.agents.enter(agent, ownerCtx.agent);
+    detachAgent = loopCtx.agents.enter(agent, parentAgent);
     loopCtx.agents.announce(agent);
     emitAgentEvent(loopCtx, agent, "agent/session-start", { source });
 

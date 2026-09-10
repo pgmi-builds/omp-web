@@ -60,6 +60,7 @@ export declare function contentHasImage(content: readonly ContentBlock[]): boole
 /**
  * True when typed model content contains a file block, walking nested
  * tool-result content on the same recursion every file policy shares.
+ * Reads current content on every call without retaining scan results.
  * @param content - typed model content blocks.
  * @returns whether any nested block is a file.
  */

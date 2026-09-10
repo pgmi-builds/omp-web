@@ -7,7 +7,7 @@
  */
 import { Context } from '@deepseek-ai/cordis';
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
-import type { GenerateOptions, LlmConfigurableProvider, LlmDiscoveredModel, LlmFailure, LlmImageRequestPricing, LlmModelContext, LlmModelDiscoveryRequest, LlmModelInfo, LlmResolvedModelInfo, LlmProviderInfo, ModelModality, StreamChunk } from './types.ts';
+import type { GenerateOptions, LlmConfigurableProvider, LlmDiscoveredModel, LlmFailure, LlmImageRequestPricing, LlmModelContext, LlmModelDiscoveryRequest, LlmModelInfo, LlmResolvedModelInfo, LlmProviderInfo, ModelModality, StreamChunk, SystemPromptUpdate } from './types.ts';
 import type { ResolvedRetryPolicy } from './retry-policy.ts';
 import type { ProviderRequestId } from './brand.ts';
 import type { LlmCallConfig, LlmCallConfigAdapterDefaults } from './call-config.ts';
@@ -97,6 +97,8 @@ export interface PreparedLlmCall {
     readonly context?: LlmModelContext;
     /** Exact model modalities captured with the adapter dispatch generation. */
     readonly inputModalities?: readonly ModelModality[];
+    /** Exact model system prompt update mode captured with the adapter dispatch generation. */
+    readonly systemPromptUpdate?: SystemPromptUpdate;
     /** Config fields materialized by the captured adapter rather than proposed by the caller. */
     readonly adapterDefaults: LlmCallConfigAdapterDefaults;
     /**

@@ -48,8 +48,9 @@ import {
   type SessionEvent,
   type SessionHeader,
 } from "@deepseek-ai/dsh-session";
-import { readOmpTranscript } from "./omp-store.js";
+import { readOmpTranscript, readOmpTranscriptSdk } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
+import { renderSystemPromptForFile } from "./sdk-client.js";
 import { supervisor } from "./supervisor.js";
 import { isPresetName, permissionEventsFor } from "./permission.js";
 import { getBridgeStore } from "./store/index.js";
@@ -64,8 +65,11 @@ interface ProjectionCacheSlice {
   ): Promise<unknown>;
 }
 
-/** Memoized replayed Dash logs, keyed by file + (size, mtime, preset). */
-const logCache = new Map<string, { size: number; mtimeMs: number; preset: string | null; events: SessionEvent[] }>();
+/** Memoized replayed Dash logs, keyed by file + (size, mtime, preset, systemPrompt). */
+const logCache = new Map<string, { size: number; mtimeMs: number; preset: string | null; systemPrompt: string | undefined; events: SessionEvent[] }>();
+
+/** Memoized cold system prompts, keyed by file + (size, mtime). */
+const systemPromptCache = new Map<string, { size: number; mtimeMs: number; value: string | undefined }>();
 
 /**
  * One open channel onto an OMP-indexed session's replayed log. Read handles
@@ -148,7 +152,7 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
         if (store === undefined) return;
         for (const row of store.list()) {
           try {
-            await cache.coldSnapshot(this.headerOf(row), SessionLogOffset(0), this.eventsOf(row));
+            await cache.coldSnapshot(this.headerOf(row), SessionLogOffset(0), await this.eventsOf(row, false));
           } catch {
             // Fail-soft per session: an unreadable transcript degrades that
             // row's projections until opened, never the boot.
@@ -183,14 +187,38 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
     return SessionPersistenceRevision(`omp:${row.transcript_size}:${row.last_modified_at}`);
   }
 
+  /** Cold system prompts, memoized per file on (size, mtime). Fail-soft. */
+  private async systemPromptFor(row: SessionRow): Promise<string | undefined> {
+    const file = row.session_file;
+    let size: number;
+    let mtimeMs: number;
+    try {
+      const stats = statSync(file);
+      size = stats.size;
+      mtimeMs = stats.mtimeMs;
+    } catch {
+      return undefined;
+    }
+    const cached = systemPromptCache.get(file);
+    if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs) return cached.value;
+    const value = await renderSystemPromptForFile(file);
+    systemPromptCache.set(file, { size, mtimeMs, value });
+    return value;
+  }
+
   /**
    * The full replayed Dash event log for one indexed session (memoized on
-   * (size, mtime, preset)), run through the shared storage validation and
-   * frozen so read handles may label it `shared-frozen`. When the index
-   * records a permission preset, the three Dash permission events are
-   * synthesized at the HEAD — OMP's transcript never records them.
+   * (size, mtime, preset, systemPrompt)), run through the shared storage
+   * validation and frozen so read handles may label it `shared-frozen`. When
+   * the index records a permission preset, the three Dash permission events
+   * are synthesized at the HEAD — OMP's transcript never records them.
+   *
+   * `includeSystemPrompt` gates the (costly) sidecar render: the boot warm
+   * pass skips it (titles/stats only), while `open` includes it so the UI's
+   * System-prompt row resolves. A render failure leaves `systemPrompt`
+   * undefined — fail-soft, never blocking list/replay.
    */
-  private eventsOf(row: SessionRow): SessionEvent[] {
+  private async eventsOf(row: SessionRow, includeSystemPrompt = true): Promise<SessionEvent[]> {
     let size: number;
     let mtimeMs: number;
     try {
@@ -201,12 +229,14 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
       return [];
     }
     const preset = row.permission_preset;
+    const systemPrompt = includeSystemPrompt ? await this.systemPromptFor(row) : undefined;
     const cached = logCache.get(row.session_file);
-    if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs && cached.preset === preset) {
+    if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs && cached.preset === preset && cached.systemPrompt === systemPrompt) {
       return cached.events;
     }
-    const { messages, modelChanges } = readOmpTranscript(row.session_file);
-    const replayed = replayOmpTranscript(messages, row.title ?? undefined, row.created_at, modelChanges);
+    const transcript = (await readOmpTranscriptSdk(row.session_file)) ?? readOmpTranscript(row.session_file);
+    const { messages, modelChanges } = transcript;
+    const replayed = replayOmpTranscript(messages, row.title ?? undefined, row.created_at, modelChanges, systemPrompt);
     const events =
       preset !== undefined && isPresetName(preset)
         ? [...permissionEventsFor(preset, row.created_at), ...replayed].map((event, index) => ({
@@ -226,7 +256,7 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
       );
       stored = [];
     }
-    logCache.set(row.session_file, { size, mtimeMs, preset, events: stored });
+    logCache.set(row.session_file, { size, mtimeMs, preset, systemPrompt, events: stored });
     return stored;
   }
 
@@ -266,7 +296,7 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
       supervisor.noteView(String(id));
       getBridgeStore()?.touchVisited(String(id), Date.now());
     }
-    return new OmpSessionHandle(this.headerOf(row), access, this.eventsOf(row));
+    return new OmpSessionHandle(this.headerOf(row), access, await this.eventsOf(row, true));
   }
 
   /** Flush every write handle — a no-op barrier: OMP owns durability. */

@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-const { replayOmpMessages } = await import("../dist/replay.js");
+const { replayOmpMessages, replayOmpTranscript } = await import("../dist/replay.js");
 
 function msg(role, timestamp, text = "") {
   return { role, timestamp, content: text ? [{ type: "text", text }] : [] };
@@ -42,4 +42,18 @@ test("missing timestamps fall back to a monotonic now-base", () => {
     assert.ok(events[i].time >= events[i - 1].time);
   }
   assert.ok(events[0].time > 0);
+});
+
+test("replayOmpTranscript writes systemPrompt into request/header system", () => {
+  const modelChanges = [{ model: "deepseek/deepseek-v4-pro", role: "default" }];
+  const events = replayOmpTranscript([], undefined, undefined, modelChanges, "RENDERED SYSTEM PROMPT");
+  const header = events.find((e) => e.type === "request/header");
+  assert.ok(header !== undefined, "request/header present");
+  assert.equal(header.data.reason, "resume");
+  assert.equal(header.data.header.system, "RENDERED SYSTEM PROMPT");
+  // absent when no system prompt is supplied (backwards-compatible shape)
+  const bare = replayOmpTranscript([], undefined, undefined, modelChanges);
+  const bareHeader = bare.find((e) => e.type === "request/header");
+  assert.ok(bareHeader !== undefined);
+  assert.equal(bareHeader.data.header.system, undefined);
 });

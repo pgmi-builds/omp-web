@@ -28,7 +28,8 @@ import type {
   CancelOptions,
   InboxTarget,
 } from "@deepseek-ai/dsh-agent";
-import { Inbox, agentEvents, type AgentEventDispatch } from "@deepseek-ai/dsh-agent";
+import { agentEvents, type AgentEventDispatch } from "@deepseek-ai/dsh-agent";
+import { Inbox } from "./inbox.js";
 import type {
   AgentCancelCause,
   Session,
@@ -41,7 +42,8 @@ import type { AssistantMessage, AssistantStreamRecord, ContentBlock, StreamChunk
 import { LlmAttemptId, ToolCallId, QUOTA_EXCEEDED_CODE, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { createScope, type Scope } from "@deepseek-ai/dsh-scope";
 import type { ApprovalOutcome, ApprovalService } from "@deepseek-ai/dsh-user-approval";
-import type { OmpAssistantMessageEvent, OmpContentBlock, OmpMessage, OmpRpcClient, RpcEvent } from "./rpc.js";
+import type { OmpAssistantMessageEvent, OmpContentBlock, OmpMessage, RpcEvent } from "./rpc-types.js";
+import type { OmpSdkClient } from "./sdk-client.js";
 // Type-only: pulls dsh-commands' `Context.commands` augmentation into this
 // compilation (the runtime service is mounted by the base bundle).
 import type {} from "@deepseek-ai/dsh-commands";
@@ -308,7 +310,7 @@ export class OmpAgent implements Agent {
   readonly session: Session;
   readonly inbox: Inbox;
   readonly ctx: Context;
-  readonly #rpc: OmpRpcClient;
+  readonly #rpc: OmpSdkClient;
   readonly #loopCtx: Context;
   readonly #scope: Scope;
   readonly #dispatch: AgentEventDispatch;
@@ -352,7 +354,7 @@ export class OmpAgent implements Agent {
   #idleExitTimer: NodeJS.Timeout | undefined = undefined;
   #disposed = false;
 
-  constructor(loopCtx: Context, id: SessionId, options: AgentOptions, session: Session, rpc: OmpRpcClient, onIdleExit?: () => void) {
+  constructor(loopCtx: Context, id: SessionId, options: AgentOptions, session: Session, rpc: OmpSdkClient, onIdleExit?: () => void) {
     this.#loopCtx = loopCtx;
     this.id = id;
     this.options = options;
@@ -360,11 +362,7 @@ export class OmpAgent implements Agent {
     this.#rpc = rpc;
     this.#onIdleExit = onIdleExit;
     this.#dispatch = agentEvents(loopCtx, this);
-    this.inbox = new Inbox(session, {
-      inserted: (message) => this.#dispatch.emit("agent/inbox/inserted", { message }),
-      discarded: (message) => this.#dispatch.emit("agent/inbox/discarded", { message }),
-      claimed: (message, turn) => this.#dispatch.emit("agent/inbox/claimed", { message, turn }),
-    });
+    this.inbox = new Inbox();
     this.#scope = createScope(loopCtx, this);
     this.ctx = this.#scope.ctx.extend({ agent: this });
     this.#lastTurn = session.snapshotEvents().findLast((event) => event.type === "turn/start")?.data.turn ?? 0;

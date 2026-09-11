@@ -17,7 +17,7 @@ import { SessionPreparation, SessionSeq, type Session, type SessionEvent } from 
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { scanForeignWriters } from "./omp-store.js";
 import { getBridgeStore } from "./store/index.js";
-import { eventsForSessionFile, ingestSessionFileGrowth, sessionCacheEntryOf } from "./session-persistence-omp.js";
+import { eventsForSessionFile, ingestSessionFileGrowth, sessionCacheEntryOf, touchSessionCacheEntry } from "./session-persistence-omp.js";
 import { FILE_FOLLOW_INTERVAL_MS, SHADOW_TTL_MS, TRANSITION_FOLLOW_INTERVAL_MS } from "./knobs.js";
 
 export type SupervisorRole = "cold" | "shadow" | "held" | "avoiding";
@@ -90,10 +90,20 @@ export class Supervisor {
   noteView(id: string): void {
     const entry = this.#entry(id);
     entry.lastViewedAt = Date.now();
+    touchSessionCacheEntry(entry.file); // LRU: mark the shared cache entry viewed too
     if (entry.role === "cold" && !entry.materializing && this.sessions !== undefined) {
       entry.materializing = true;
       void this.#materialize(id, entry);
     }
+  }
+
+  /** Whether this transcript file's session is actively followed (shadow or held). */
+  isFollowed(file: string): boolean {
+    if (file === "") return false;
+    for (const entry of this.entries.values()) {
+      if (entry.file === file && (entry.role === "shadow" || entry.role === "held")) return true;
+    }
+    return false;
   }
   /** Sync entries against the store; drop gone files; refresh role-agnostic state. */
   reconcile(): void {

@@ -19,8 +19,10 @@
  * is the DASH-facing id (the index's `dsh_session_id`) — OMP ids never
  * leave the bridge.
  */
-import { readFileSync, statSync } from "node:fs";
-import { basename } from "node:path";
+import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { homedir } from "node:os";
+import { basename, join, resolve } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import {
   SessionPersistence,
@@ -55,6 +57,7 @@ import { supervisor } from "./supervisor.js";
 import { isPresetName, permissionEventsFor } from "./permission.js";
 import { getBridgeStore } from "./store/index.js";
 import type { SessionRow } from "./store/db.js";
+import { OMP_CACHE_DIR, OMP_CACHE_DISK, OMP_CACHE_MAX_BYTES, OMP_CACHE_MAX_ENTRIES } from "./knobs.js";
 
 /** The slice of `ctx.sessionProjectionCache` the boot warm pass reads. */
 interface ProjectionCacheSlice {
@@ -83,6 +86,10 @@ export interface SessionCacheEntry {
   events: SessionEvent[];
   /** Ingest cursor (lastSeq/size/mtime) — moved from the supervisor's Entry. */
   cursor: SessionCacheCursor;
+  /** Dash-facing id (the disk-tier filename); set at fill time. */
+  dshId: string;
+  /** LRU recency (epoch ms). `0` = never viewed this process (e.g. boot warm). */
+  lastViewedAt: number;
 }
 
 /** THE single cache map for parsed transcript data, keyed by file path. */
@@ -102,6 +109,329 @@ const traceParse = (file: string): void => {
 /** Test/diagnostic seam: total completed parses since process start (a stat-ok-but-empty read counts as one). */
 export function getParseCount(): number {
   return parseSeq;
+}
+
+// ---------------------------------------------------------------------------
+// Disk tier (T17) + bounded-memory LRU (T18) + disk-dir cleanup (T19).
+// ---------------------------------------------------------------------------
+
+/** Cache policy: in-memory caps + disk-tier on/off + dir + version resolver. */
+export interface CachePolicy {
+  maxEntries: number;
+  maxBytes: number;
+  diskEnabled: boolean;
+  diskDir: string;
+  ompVersion: () => string;
+}
+
+const UNKNOWN_VERSION = "unknown";
+const DISK_FLUSH_DELAY_MS = 2_000;
+
+let defaultPolicy: CachePolicy | null = null;
+
+/** Resolve the replay-cache dir exactly the way the bridge store resolves its DB dir. */
+function resolveReplayCacheDir(): string {
+  const explicit = OMP_CACHE_DIR;
+  if (explicit !== undefined && explicit !== "" && !explicit.startsWith("/")) {
+    // Fail-soft: a relative override disables the disk tier rather than failing boot.
+    return "";
+  }
+  return resolve(
+    explicit !== undefined && explicit !== ""
+      ? explicit
+      : join(process.env.DSH_HOME ?? join(homedir(), ".omp", "dsh"), "cache", "replay"),
+  );
+}
+
+function resolveDefaultPolicy(): CachePolicy {
+  if (defaultPolicy === null) {
+    defaultPolicy = {
+      maxEntries: OMP_CACHE_MAX_ENTRIES,
+      maxBytes: OMP_CACHE_MAX_BYTES,
+      diskEnabled: OMP_CACHE_DISK,
+      diskDir: OMP_CACHE_DISK ? resolveReplayCacheDir() : "",
+      ompVersion: memoizedOmpVersion,
+    };
+  }
+  return defaultPolicy;
+}
+
+let policyOverride: Partial<CachePolicy> | null = null;
+
+function policy(): CachePolicy {
+  if (policyOverride === null) return resolveDefaultPolicy();
+  return { ...resolveDefaultPolicy(), ...policyOverride };
+}
+
+let ompVersionMemo: string | undefined;
+
+/**
+ * The process OMP version, obtained once and memoized. `omp --version` is the
+ * authoritative user-facing version (e.g. 18.1.16); the sidecar's `sys.ping.sdk`
+ * exposes the embedded SDK LIBRARY version (e.g. 18.1.14) — a different value, so
+ * it is not a faithful `ompVersion`. Resolved lazily (only when the disk tier first
+ * needs a fingerprint) and synchronously (the fingerprint is also written from the
+ * synchronous LRU flush-before-evict path). Any failure resolves to `"unknown"`,
+ * which only matches a disk fingerprint that is ALSO `"unknown"` (a fingerprint
+ * carrying `"unknown"` is never trusted against a real in-process version).
+ */
+function memoizedOmpVersion(): string {
+  if (ompVersionMemo !== undefined) return ompVersionMemo;
+  try {
+    const result = spawnSync("omp", ["--version"], { encoding: "utf8", timeout: 3_000 });
+    const text = result.error === undefined && result.status === 0 ? (result.stdout ?? "").trim() : "";
+    ompVersionMemo = text === "" ? UNKNOWN_VERSION : text;
+  } catch {
+    ompVersionMemo = UNKNOWN_VERSION;
+  }
+  return ompVersionMemo;
+}
+
+/** The disk file payload: a fingerprint + the replayed/validated event log. */
+interface DiskCacheFile {
+  fingerprint: {
+    size: number;
+    mtimeMs: number;
+    ompVersion: string;
+    preset: string | null;
+    formatVersion: number;
+  };
+  events: SessionEvent[];
+}
+
+/** Guard a dash id for use as a filename component (ids are uuids; defensive). */
+function safeDiskName(dshId: string): string {
+  return dshId.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function diskFilePath(dshId: string): string {
+  return join(policy().diskDir, `${safeDiskName(dshId)}.json`);
+}
+
+// Debounced flush state (dirty files awaiting their next write).
+const diskDirty = new Set<string>();
+let diskFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let swept = false;
+
+/** Write one entry to its disk file atomically (tmp + rename). */
+function writeDiskEntry(entry: SessionCacheEntry): void {
+  const p = policy();
+  if (!p.diskEnabled || p.diskDir === "") return;
+  ensureDiskSweep();
+  const payload: DiskCacheFile = {
+    fingerprint: {
+      size: entry.size,
+      mtimeMs: entry.mtimeMs,
+      ompVersion: p.ompVersion(),
+      preset: entry.preset,
+      formatVersion: SESSION_FORMAT_VERSION,
+    },
+    events: entry.events,
+  };
+  try {
+    mkdirSync(p.diskDir, { recursive: true }); // whole-directory deletion self-heals here
+    const target = diskFilePath(entry.dshId);
+    const tmp = `${target}.tmp`;
+    writeFileSync(tmp, JSON.stringify(payload));
+    renameSync(tmp, target);
+  } catch {
+    // Non-fatal: the disk tier is a cache; OMP's transcript remains the record of truth.
+  }
+}
+
+/** Schedule a debounced (~2s) flush of one file after an incremental append. */
+function scheduleDiskWrite(file: string): void {
+  const p = policy();
+  if (!p.diskEnabled || p.diskDir === "") return;
+  diskDirty.add(file);
+  if (diskFlushTimer !== null) return;
+  diskFlushTimer = setTimeout(() => {
+    diskFlushTimer = null;
+    flushDiskNow();
+  }, DISK_FLUSH_DELAY_MS);
+  diskFlushTimer.unref?.();
+}
+
+/** Flush every dirty file's current entry state to disk (idle-safe). */
+function flushDiskNow(): void {
+  if (diskFlushTimer !== null) {
+    clearTimeout(diskFlushTimer);
+    diskFlushTimer = null;
+  }
+  for (const file of [...diskDirty]) {
+    diskDirty.delete(file);
+    const entry = sessionCache.get(file);
+    if (entry !== undefined) writeDiskEntry(entry);
+  }
+}
+
+/** Load + re-validate one disk replay; undefined on any mismatch/throw (→ normal fill). */
+function adoptFromDisk(
+  file: string,
+  size: number,
+  mtimeMs: number,
+  preset: string | null,
+  header: SessionHeader,
+  dshId: string,
+): SessionEvent[] | undefined {
+  const p = policy();
+  if (!p.diskEnabled || p.diskDir === "") return undefined;
+  ensureDiskSweep();
+  let raw: string;
+  try {
+    raw = readFileSync(diskFilePath(dshId), "utf8");
+  } catch {
+    return undefined;
+  }
+  let parsed: DiskCacheFile;
+  try {
+    parsed = JSON.parse(raw) as DiskCacheFile;
+  } catch {
+    return undefined;
+  }
+  const fp = parsed?.fingerprint;
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    !Array.isArray(parsed.events) ||
+    fp === null ||
+    typeof fp !== "object" ||
+    fp.size !== size ||
+    fp.mtimeMs !== mtimeMs ||
+    fp.preset !== preset ||
+    fp.formatVersion !== SESSION_FORMAT_VERSION ||
+    fp.ompVersion !== p.ompVersion()
+  ) {
+    return undefined;
+  }
+  let adopted: SessionEvent[];
+  try {
+    // Re-validate before trusting: a corrupt-but-fingerprint-matching file must
+    // never reach a reader.
+    adopted = validateStoredEvents(header, parsed.events);
+    assertContiguous(header.id, adopted, 0);
+  } catch {
+    return undefined;
+  }
+  // Adopt: L1 (messages) is write-only dead weight, so it starts empty and is
+  // re-derived on the next growth ingest.
+  sessionCache.set(file, {
+    size,
+    mtimeMs,
+    preset,
+    messages: [],
+    events: adopted,
+    cursor: { lastSeq: adopted.length, size, mtimeMs },
+    dshId,
+    lastViewedAt: 0,
+  });
+  return adopted;
+}
+
+/** Whether this file's entry must not be evicted (live follow or in-flight fill). */
+function isExemptFromEviction(file: string): boolean {
+  if (inflightFills.has(file)) return true;
+  return supervisor.isFollowed(file);
+}
+
+/** Enforce the in-memory caps, coldest first; flush-before-evict, skip exempt entries. */
+function evictColdest(protectFile?: string): void {
+  const p = policy();
+  if (p.maxEntries === 0 && p.maxBytes === 0) return;
+  const maxEntries = p.maxEntries === 0 ? Number.POSITIVE_INFINITY : p.maxEntries;
+  const maxBytes = p.maxBytes === 0 ? Number.POSITIVE_INFINITY : p.maxBytes;
+  const totalBytes = (): number => {
+    let bytes = 0;
+    for (const entry of sessionCache.values()) bytes += entry.size;
+    return bytes;
+  };
+  if (sessionCache.size <= maxEntries && totalBytes() <= maxBytes) return;
+  const candidates = [...sessionCache.entries()]
+    .filter(([file]) => file !== protectFile && !isExemptFromEviction(file))
+    .sort((a, b) => a[1].lastViewedAt - b[1].lastViewedAt);
+  for (const [file, entry] of candidates) {
+    if (sessionCache.size <= maxEntries && totalBytes() <= maxBytes) break;
+    writeDiskEntry(entry); // flush-before-evict: the replay survives in the disk tier
+    sessionCache.delete(file);
+  }
+}
+
+/** atime-based lazy sweep of the disk dir beyond the entry cap (boot-time). */
+function sweepReplayCacheDir(): void {
+  const p = policy();
+  if (!p.diskEnabled || p.diskDir === "") return;
+  if (p.maxEntries === 0) return; // unlimited → no cap to enforce
+  let names: string[];
+  try {
+    names = readdirSync(p.diskDir);
+  } catch {
+    return; // dir missing → nothing to sweep (the next write recreates it)
+  }
+  const files = names
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => join(p.diskDir, name))
+    .map((path) => {
+      try {
+        return { path, atimeMs: statSync(path).atimeMs };
+      } catch {
+        return { path, atimeMs: 0 };
+      }
+    })
+    .sort((a, b) => a.atimeMs - b.atimeMs);
+  const excess = files.length - p.maxEntries;
+  if (excess <= 0) return;
+  for (const file of files.slice(0, excess)) {
+    try {
+      unlinkSync(file.path);
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+/** Kick off one lazy boot sweep (deferred to first disk use, never at module load). */
+function ensureDiskSweep(): void {
+  if (swept) return;
+  swept = true;
+  sweepReplayCacheDir();
+}
+
+/** Mark one cache entry as just-viewed (LRU recency). */
+export function touchSessionCacheEntry(file: string): void {
+  const entry = sessionCache.get(file);
+  if (entry !== undefined) entry.lastViewedAt = Date.now();
+}
+
+/** Test/diagnostic seam: override cache-policy bits in-process (pass null to reset). */
+export function _setCachePolicyForTest(override: Partial<CachePolicy> | null): void {
+  policyOverride = override;
+  swept = false;
+  if (diskFlushTimer !== null) {
+    clearTimeout(diskFlushTimer);
+    diskFlushTimer = null;
+  }
+  diskDirty.clear();
+}
+
+/** Test/diagnostic seam: drop the in-memory cache for a hermetic next test. */
+export function _clearSessionCacheForTest(): void {
+  sessionCache.clear();
+  inflightFills.clear();
+  if (diskFlushTimer !== null) {
+    clearTimeout(diskFlushTimer);
+    diskFlushTimer = null;
+  }
+  diskDirty.clear();
+}
+
+/** Test/diagnostic seam: flush pending debounced writes immediately. */
+export function _flushDiskForTest(): void {
+  flushDiskNow();
+}
+
+/** Test/diagnostic seam: run the disk-dir atime sweep synchronously. */
+export function _sweepReplayCacheDirForTest(): void {
+  sweepReplayCacheDir();
 }
 
 /** The L1 transcript reader: SDK-first, JSONL fallback. Injectable for tests. */
@@ -149,6 +479,9 @@ export async function eventsForSessionCache(fill: SessionCacheFill): Promise<Ses
   if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs && cached.preset === preset) {
     return cached.events;
   }
+  // Disk tier (cold miss + boot warm): adopt a matching, valid disk replay.
+  const adopted = adoptFromDisk(file, size, mtimeMs, preset, header, String(header.id));
+  if (adopted !== undefined) return adopted;
   const pending = inflightFills.get(file);
   if (pending !== undefined) return pending;
   const run = fillSessionCacheEntry(file, preset, title, createdAt, header, logger, readTranscript, size, mtimeMs);
@@ -195,7 +528,18 @@ function storeValidated(
     logger.warn(`omp persistence: replay of "${file}" failed storage validation; serving empty log (${String(error)})`);
     stored = [];
   }
-  sessionCache.set(file, { size, mtimeMs, preset, messages, events: stored, cursor: { lastSeq: stored.length, size, mtimeMs } });
+  const previous = sessionCache.get(file);
+  sessionCache.set(file, {
+    size,
+    mtimeMs,
+    preset,
+    messages,
+    events: stored,
+    cursor: { lastSeq: stored.length, size, mtimeMs },
+    dshId: String(header.id),
+    lastViewedAt: previous?.lastViewedAt ?? 0,
+  });
+  evictColdest(file);
   return stored;
 }
 
@@ -213,7 +557,10 @@ async function fillSessionCacheEntry(
   const { messages, modelChanges } = await readTranscript(file);
   traceParse(file);
   const lenient = replayLenient(preset, title, createdAt, messages, modelChanges);
-  return storeValidated(file, preset, messages, lenient, size, mtimeMs, header, logger);
+  const stored = storeValidated(file, preset, messages, lenient, size, mtimeMs, header, logger);
+  const entry = sessionCache.get(file);
+  if (entry !== undefined) writeDiskEntry(entry); // after L2 fill: persist the replay
+  return stored;
 }
 
 /** Read the live cache entry for a file (supervisor cursor access). */
@@ -290,6 +637,7 @@ export async function ingestSessionFileGrowth(
   const foreign = lenient.slice(cursor.lastSeq);
   const validated = storeValidated(file, preset, messages, lenient, size, mtimeMs, header, logger);
   const shadow = validated.slice(cursor.lastSeq);
+  scheduleDiskWrite(file); // after incremental append: debounced (~2s) flush
   return { foreign, shadow };
 }
 
@@ -473,7 +821,9 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
       supervisor.noteView(String(id));
       getBridgeStore()?.touchVisited(String(id), Date.now());
     }
-    return new OmpSessionHandle(this.headerOf(row), access, await this.eventsOf(row));
+    const events = await this.eventsOf(row);
+    if (access === "read") touchSessionCacheEntry(row.session_file); // LRU recency
+    return new OmpSessionHandle(this.headerOf(row), access, events);
   }
 
   /** Flush every write handle — a no-op barrier: OMP owns durability. */

@@ -25,6 +25,8 @@ import {
   _flushDiskForTest,
   _setCachePolicyForTest,
   _sweepReplayCacheDirForTest,
+  _cacheSizeForTest,
+  _getDiskReadCountForTest,
   eventsForSessionCache,
   getParseCount,
   ingestSessionFileGrowth,
@@ -72,6 +74,8 @@ function countingReader(state) {
     return readOmpTranscript(file);
   };
 }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function diskFile(cacheDir, id) {
   return join(cacheDir, `${id}.json`);
@@ -200,9 +204,12 @@ test("LRU evict/refill: coldest entry is evicted (flush-before-evict) and refill
     _setCachePolicyForTest({ diskEnabled: true, diskDir: cacheDir, maxEntries: 2, maxBytes: 0, ompVersion: () => "v-test" });
 
     await eventsForSessionCache(fill(fa, "sess-a", countingReader(state)));
-    touchSessionCacheEntry(fa); // A was viewed → not the coldest
+    await sleep(5);
     await eventsForSessionCache(fill(fb, "sess-b", countingReader(state)));
-    // Filling C exceeds the cap of 2 → evict the coldest (B, never viewed).
+    await sleep(5);
+    touchSessionCacheEntry(fa); // view A AFTER B → A is now the newest
+    await sleep(5);
+    // Filling C exceeds the cap of 2 → evict the coldest (B, viewed longest ago).
     await eventsForSessionCache(fill(fc, "sess-c", countingReader(state)));
 
     assert.ok(sessionCacheEntryOf(fb) === undefined, "the coldest entry (B) was evicted");
@@ -216,6 +223,75 @@ test("LRU evict/refill: coldest entry is evicted (flush-before-evict) and refill
     assert.ok(refilled.length > 0, "evicted entry refills on next access");
     assert.equal(getParseCount(), before, "refill adopted from disk without a re-parse");
     assert.ok(sessionCacheEntryOf(fb) !== undefined, "B is back in memory");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(cacheDir, { recursive: true, force: true });
+    _setCachePolicyForTest(null);
+    _clearSessionCacheForTest();
+  }
+});
+
+test("adoption under cap pressure: map bounded, adopted-then-viewed entry survives", async () => {
+  const cacheDir = tempDir("omp-disk-adopt-cap-");
+  const dir = tempDir("omp-disk-src-");
+  const fa = tempFile(dir, "a.jsonl", `${userLine("a", 1000)}\n`);
+  const fb = tempFile(dir, "b.jsonl", `${userLine("b", 1000)}\n`);
+  const fc = tempFile(dir, "c.jsonl", `${userLine("c", 1000)}\n`);
+  try {
+    // Setup: fill the three transcripts under an unlimited cap so their disk
+    // files exist, then drop memory (disk tier only).
+    _setCachePolicyForTest({ diskEnabled: true, diskDir: cacheDir, maxEntries: 0, maxBytes: 0, ompVersion: () => "v-test" });
+    await eventsForSessionCache(fill(fa, "sess-a", reader));
+    await eventsForSessionCache(fill(fb, "sess-b", reader));
+    await eventsForSessionCache(fill(fc, "sess-c", reader));
+    _clearSessionCacheForTest();
+
+    // Re-adopt under a cap of 2: every adoption stores-then-evicts.
+    const state = { reads: 0 };
+    _setCachePolicyForTest({ diskEnabled: true, diskDir: cacheDir, maxEntries: 2, maxBytes: 0, ompVersion: () => "v-test" });
+    await eventsForSessionCache(fill(fa, "sess-a", countingReader(state))); // adopt A
+    await sleep(5);
+    await eventsForSessionCache(fill(fb, "sess-b", countingReader(state))); // adopt B
+    await sleep(5);
+    touchSessionCacheEntry(fa); // view A AFTER B → A is the newest
+    await sleep(5);
+    await eventsForSessionCache(fill(fc, "sess-c", countingReader(state))); // adopt C → evict coldest
+
+    assert.equal(state.reads, 0, "all three were adopted (zero parses)");
+    assert.equal(_cacheSizeForTest(), 2, "map is bounded at the cap");
+    assert.ok(sessionCacheEntryOf(fa) !== undefined, "adopted-then-viewed A survived its own open");
+    assert.ok(sessionCacheEntryOf(fb) === undefined, "unviewed B was evicted");
+    assert.ok(sessionCacheEntryOf(fc) !== undefined, "C survived");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(cacheDir, { recursive: true, force: true });
+    _setCachePolicyForTest(null);
+    _clearSessionCacheForTest();
+  }
+});
+
+test("concurrent same-file open during in-flight fill shares the pending fill (no redundant disk read)", async () => {
+  const cacheDir = tempDir("omp-disk-concurrent-");
+  const dir = tempDir("omp-disk-src-");
+  const file = tempFile(dir, "a.jsonl", `${userLine("hi", 1000)}\n`);
+  try {
+    // Disk enabled but no disk file yet → the first fill misses adoption and parses.
+    _setCachePolicyForTest({ diskEnabled: true, diskDir: cacheDir, maxEntries: 0, maxBytes: 0, ompVersion: () => "v-test" });
+    let resolveRead;
+    const deferred = new Promise((resolve) => { resolveRead = resolve; });
+    const blockingReader = () => deferred.then(() => readOmpTranscript(file));
+
+    const before = _getDiskReadCountForTest();
+    const p1 = eventsForSessionCache(fill(file, "sess-a", blockingReader));
+    // p1 is now in-flight (stat → cache miss → inflight miss → adoption miss → fill awaiting reader).
+    const p2 = eventsForSessionCache(fill(file, "sess-a", blockingReader));
+    // p2 must hit the single-flight guard and NOT re-attempt the disk read.
+    assert.equal(_getDiskReadCountForTest(), before + 1, "concurrent caller performed no redundant disk read");
+
+    resolveRead();
+    const [e1, e2] = await Promise.all([p1, p2]);
+    assert.equal(e1, e2, "concurrent callers share the in-flight fill result");
+    assert.ok(e1.length > 0, "the shared fill served a real replay");
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(cacheDir, { recursive: true, force: true });

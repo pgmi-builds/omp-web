@@ -99,7 +99,7 @@ const traceParse = (file: string): void => {
   if (TRACE) process.stderr.write(`[omp-cache ${Date.now() % 1_000_000}] parse ${file} (seq ${parseSeq})\n`);
 };
 
-/** Test/diagnostic seam: total completed parses since process start. */
+/** Test/diagnostic seam: total completed parses since process start (a stat-ok-but-empty read counts as one). */
 export function getParseCount(): number {
   return parseSeq;
 }
@@ -107,8 +107,15 @@ export function getParseCount(): number {
 /** The L1 transcript reader: SDK-first, JSONL fallback. Injectable for tests. */
 type TranscriptReader = (file: string) => Promise<OmpTranscript>;
 
-const defaultReader: TranscriptReader = async (file) =>
-  (await readOmpTranscriptSdk(file)) ?? readOmpTranscript(file);
+const defaultReader: TranscriptReader = async (file) => {
+  // SDK is canonical when it has content; when it fails OR returns an empty
+  // transcript the JSONL is the sole record of truth, so fall back — this keeps
+  // one reader chain (SDK→JSONL) for BOTH the cold fill and the growth ingest
+  // so they never derive divergent event counts that would skew cursor slicing.
+  const sdk = await readOmpTranscriptSdk(file);
+  if (sdk !== undefined && sdk.messages.length > 0) return sdk;
+  return readOmpTranscript(file);
+};
 
 /** Inputs for one unified {@link SessionCacheEntry} fill. */
 export interface SessionCacheFill {
@@ -153,31 +160,38 @@ export async function eventsForSessionCache(fill: SessionCacheFill): Promise<Ses
   }
 }
 
-function stageSessionCacheEntry(
-  file: string,
+/** Lenient (unvalidated) replay of one transcript, with the permission prefix. */
+function replayLenient(
   preset: string | null,
   title: string | undefined,
   createdAt: number,
-  header: SessionHeader,
-  logger: { warn: (message: string) => void },
   messages: OmpMessage[],
   modelChanges: OmpModelChange[],
+): SessionEvent[] {
+  const replayed = replayOmpTranscript(messages, title, createdAt, modelChanges);
+  return preset !== undefined && isPresetName(preset)
+    ? [...permissionEventsFor(preset, createdAt), ...replayed].map((event, index) => ({ ...event, seq: SessionSeq(index) }))
+    : replayed;
+}
+
+/** Validate (fail-soft to []), store, and return the frozen validated events. */
+function storeValidated(
+  file: string,
+  preset: string | null,
+  messages: OmpMessage[],
+  lenient: SessionEvent[],
   size: number,
   mtimeMs: number,
+  header: SessionHeader,
+  logger: { warn: (message: string) => void },
 ): SessionEvent[] {
-  traceParse(file);
-  const replayed = replayOmpTranscript(messages, title, createdAt, modelChanges);
-  const events =
-    preset !== undefined && isPresetName(preset)
-      ? [...permissionEventsFor(preset, createdAt), ...replayed].map((event, index) => ({ ...event, seq: SessionSeq(index) }))
-      : replayed;
   let stored: SessionEvent[];
   try {
-    stored = validateStoredEvents(header, events);
+    stored = validateStoredEvents(header, lenient);
     assertContiguous(header.id, stored, 0);
   } catch (error) {
-    // A malformed replay degrades that file's reads to an empty log until its
-    // (size, mtime) changes — fail-soft, never the caller's boot/tick.
+    // A malformed replay degrades that file's cold reads to an empty log until
+    // its (size, mtime) changes — fail-soft, never the caller's boot/tick.
     logger.warn(`omp persistence: replay of "${file}" failed storage validation; serving empty log (${String(error)})`);
     stored = [];
   }
@@ -197,7 +211,9 @@ async function fillSessionCacheEntry(
   mtimeMs: number,
 ): Promise<SessionEvent[]> {
   const { messages, modelChanges } = await readTranscript(file);
-  return stageSessionCacheEntry(file, preset, title, createdAt, header, logger, messages, modelChanges, size, mtimeMs);
+  traceParse(file);
+  const lenient = replayLenient(preset, title, createdAt, messages, modelChanges);
+  return storeValidated(file, preset, messages, lenient, size, mtimeMs, header, logger);
 }
 
 /** Read the live cache entry for a file (supervisor cursor access). */
@@ -227,38 +243,32 @@ export async function eventsForSessionFile(
   });
 }
 
-export function fillSessionCacheEntrySync(file: string, id: string, logger: { warn: (message: string) => void }): SessionEvent[] {
-  let size: number;
-  let mtimeMs: number;
-  try {
-    const stats = statSync(file);
-    size = stats.size;
-    mtimeMs = stats.mtimeMs;
-  } catch {
-    return [];
-  }
-  const row = getBridgeStore()?.byFile(file);
-  const preset = row?.permission_preset ?? null;
-  const cached = sessionCache.get(file);
-  if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs && cached.preset === preset) {
-    return cached.events;
-  }
-  const { messages, modelChanges } = readOmpTranscript(file);
-  const header = row === undefined ? sessionHeaderForId(id) : sessionHeaderOf(row);
-  return stageSessionCacheEntry(file, preset, row?.title ?? undefined, row?.created_at ?? 0, header, logger, messages, modelChanges, size, mtimeMs);
+/** One growth pass: the lenient delta (detection) and the validated delta (projection). */
+export interface SessionGrowth {
+  /** Lenient (unvalidated) delta events past the cursor — for foreign-writer detection. */
+  foreign: SessionEvent[];
+  /** Validated + frozen delta — for the shadow projection (empty on validation failure). */
+  shadow: SessionEvent[];
 }
 
 /**
- * The supervisor's synchronous incremental ingest: stat the file against the
- * entry's cursor and, on growth, re-fill (sync JSONL) and return ONLY the
- * delta events past `cursor.lastSeq`. The fill advances the entry's cursor and
- * swaps in the new frozen `events` array, so a teardown → cold-read with no
- * further change re-serves the entry without a re-parse.
+ * The supervisor's incremental ingest (async, single reader lineage): stat the
+ * file against the entry's cursor and, on growth, re-read + re-replay through
+ * the SAME reader chain as the cold fill (`defaultReader`), then slice the
+ * delta. Foreign detection runs on the LENIENT delta regardless of the entry
+ * validation outcome; the validated delta feeds the shadow (empty on a
+ * validation failure, whose entry re-fills fail-soft to an empty log — a later
+ * growth then full-rescans, which is idempotent for detection).
  */
-export function ingestSessionFileGrowthSync(file: string, id: string, logger: { warn: (message: string) => void }): SessionEvent[] {
+export async function ingestSessionFileGrowth(
+  file: string,
+  id: string,
+  logger: { warn: (message: string) => void },
+  readTranscript: TranscriptReader = defaultReader,
+): Promise<SessionGrowth> {
   const cached = sessionCache.get(file);
   const cursor = cached?.cursor;
-  if (cursor === undefined) return [];
+  if (cursor === undefined) return { foreign: [], shadow: [] };
   let size: number;
   let mtimeMs: number;
   try {
@@ -266,11 +276,21 @@ export function ingestSessionFileGrowthSync(file: string, id: string, logger: { 
     size = stats.size;
     mtimeMs = stats.mtimeMs;
   } catch {
-    return [];
+    return { foreign: [], shadow: [] };
   }
-  if (size === cursor.size && mtimeMs === cursor.mtimeMs) return [];
-  const events = fillSessionCacheEntrySync(file, id, logger);
-  return events.slice(cursor.lastSeq);
+  if (size === cursor.size && mtimeMs === cursor.mtimeMs) return { foreign: [], shadow: [] };
+  const row = getBridgeStore()?.byFile(file);
+  const preset = row?.permission_preset ?? null;
+  const title = row?.title ?? undefined;
+  const createdAt = row?.created_at ?? 0;
+  const header = row === undefined ? sessionHeaderForId(id) : sessionHeaderOf(row);
+  const { messages, modelChanges } = await readTranscript(file);
+  traceParse(file);
+  const lenient = replayLenient(preset, title, createdAt, messages, modelChanges);
+  const foreign = lenient.slice(cursor.lastSeq);
+  const validated = storeValidated(file, preset, messages, lenient, size, mtimeMs, header, logger);
+  const shadow = validated.slice(cursor.lastSeq);
+  return { foreign, shadow };
 }
 
 /**

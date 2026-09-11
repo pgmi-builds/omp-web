@@ -158,7 +158,7 @@ export class Supervisor {
       // the file's current end so only records written AFTER this point are
       // judged (no history false positives — historical user texts are not in
       // knownUserTexts). Fire-and-forget; the fill is single-flight.
-      entry.pendingBaseline = this.#baselineFile(id, file);
+      entry.pendingBaseline = this.#baselineFile(id, file).catch(() => {});
     }
   }
 
@@ -304,6 +304,9 @@ export class Supervisor {
       if (foreignText !== "") this.#onForeignUser(id, entry, foreignText);
     } catch {
       // A transient read/stat/replay failure must never wedge a follow tick.
+      // Clear a rejected baseline too: stored un-caught it would re-reject on
+      // every later #ingest await, wedging the hold.
+      entry.pendingBaseline = undefined;
     } finally {
       entry.ingesting = false;
     }

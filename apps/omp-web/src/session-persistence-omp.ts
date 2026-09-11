@@ -88,7 +88,7 @@ export interface SessionCacheEntry {
   cursor: SessionCacheCursor;
   /** Dash-facing id (the disk-tier filename); set at fill time. */
   dshId: string;
-  /** LRU recency (epoch ms). `0` = never viewed this process (e.g. boot warm). */
+  /** LRU recency proxy (epoch ms): last view OR create OR update in this process. */
   lastViewedAt: number;
 }
 
@@ -134,6 +134,7 @@ function resolveReplayCacheDir(): string {
   const explicit = OMP_CACHE_DIR;
   if (explicit !== undefined && explicit !== "" && !explicit.startsWith("/")) {
     // Fail-soft: a relative override disables the disk tier rather than failing boot.
+    process.stderr.write(`[omp-cache] OMP_CACHE_DIR="${explicit}" is not an absolute path — disk replay tier disabled\n`);
     return "";
   }
   return resolve(
@@ -377,7 +378,9 @@ function sweepReplayCacheDir(): void {
     return; // dir missing → nothing to sweep (the next write recreates it)
   }
   const files = names
-    .filter((name) => name.endsWith(".json"))
+    // Both `<id>.json` and its crash orphan `<id>.json.tmp` are sweep-eligible;
+    // the adoption path still reads exactly `<id>.json` (eligibility ≠ adoption).
+    .filter((name) => name.endsWith(".json") || name.endsWith(".json.tmp"))
     .map((name) => join(p.diskDir, name))
     .map((path) => {
       try {
@@ -751,7 +754,9 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
    * titles/stats) for every indexed session under its DASH id, so the first
    * WebUI landing renders real titles instead of cwd-basename fallbacks.
    * Calls the projection cache directly with the replayed log — deliberately
-   * NOT through `open`, so boot warming never counts as "viewed".
+   * NOT through `open`: boot warming never counts as a "view" for supervisor /
+   * visited-at bookkeeping — the projection fill it triggers still stamps the
+   * cache entry's LRU recency (`lastViewedAt`).
    */
   private warmProjectionCacheOnce(): void {
     this.ctx.inject(["sessionProjectionCache"], (warmCtx) => {

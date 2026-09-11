@@ -6,8 +6,8 @@
  * `list` / `stat` / cold history all resolve through the index (O(1) by dsh
  * id / file), never a full store scan. The OMP native store remains the ONLY
  * transcript of record — cold events replay the OMP JSONL on demand,
- * memoized per file keyed on (size, mtime, preset), validated and frozen at
- * fill time, and handed to readers as `shared-frozen` values.
+ * single per-file `SessionCacheEntry` (L1 parse + L2 replayed/validated
+ * events) with single-flight fill, handed to readers as `shared-frozen` values.
  *
  * Writes: OMP owns physical durability. `create` / `open(id, "write")`
  * return handles whose appends buffer in memory only — enough for
@@ -48,7 +48,8 @@ import {
   type SessionEvent,
   type SessionHeader,
 } from "@deepseek-ai/dsh-session";
-import { readOmpTranscript, readOmpTranscriptSdk } from "./omp-store.js";
+import { readOmpTranscript, readOmpTranscriptSdk, type OmpTranscript } from "./omp-store.js";
+import type { OmpMessage } from "./rpc-types.js";
 import { replayOmpTranscript } from "./replay.js";
 import { supervisor } from "./supervisor.js";
 import { isPresetName, permissionEventsFor } from "./permission.js";
@@ -64,8 +65,111 @@ interface ProjectionCacheSlice {
   ): Promise<unknown>;
 }
 
-/** Memoized replayed Dash logs, keyed by file + (size, mtime, preset). */
-const logCache = new Map<string, { size: number; mtimeMs: number; preset: string | null; events: SessionEvent[] }>();
+/** One transcript file's staged parse: L1 raw messages, L2 replayed events. */
+interface SessionCacheEntry {
+  size: number;
+  mtimeMs: number;
+  preset: string | null;
+  /** L1: raw transcript messages (SDK or JSONL fallback). */
+  messages: OmpMessage[];
+  /** L2: replayed + validated + frozen Dash event log. */
+  events: SessionEvent[];
+}
+
+/** THE single cache map for parsed transcript data, keyed by file path. */
+const sessionCache = new Map<string, SessionCacheEntry>();
+
+/** In-flight fills keyed by file path — concurrent opens share ONE parse. */
+const inflightFills = new Map<string, Promise<SessionEvent[]>>();
+
+/** Diagnostic parse trace (set OMP_TRACE=1 on the dsh process to enable). */
+const TRACE = process.env.OMP_TRACE === "1";
+let parseSeq = 0;
+const traceParse = (file: string): void => {
+  parseSeq += 1;
+  if (TRACE) process.stderr.write(`[omp-cache ${Date.now() % 1_000_000}] parse ${file} (seq ${parseSeq})\n`);
+};
+
+/** The L1 transcript reader: SDK-first, JSONL fallback. Injectable for tests. */
+type TranscriptReader = (file: string) => Promise<OmpTranscript>;
+
+const defaultReader: TranscriptReader = async (file) =>
+  (await readOmpTranscriptSdk(file)) ?? readOmpTranscript(file);
+
+/** Inputs for one unified {@link SessionCacheEntry} fill. */
+export interface SessionCacheFill {
+  file: string;
+  preset: string | null;
+  title?: string;
+  createdAt: number;
+  header: SessionHeader;
+  logger: { warn: (message: string) => void };
+  /** L1 reader override (tests); defaults to SDK-first + JSONL fallback. */
+  readTranscript?: TranscriptReader;
+}
+
+/**
+ * The unified fill path for one transcript file (L1 parse → L2 replay) behind
+ * ONE cache map with a single-flight guard: concurrent callers of the same
+ * file share one parse; every `(size, mtime, preset)` state parses once.
+ */
+export async function eventsForSessionCache(fill: SessionCacheFill): Promise<SessionEvent[]> {
+  const { file, preset, title, createdAt, header, logger, readTranscript = defaultReader } = fill;
+  let size: number;
+  let mtimeMs: number;
+  try {
+    const stats = statSync(file);
+    size = stats.size;
+    mtimeMs = stats.mtimeMs;
+  } catch {
+    return [];
+  }
+  const cached = sessionCache.get(file);
+  if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs && cached.preset === preset) {
+    return cached.events;
+  }
+  const pending = inflightFills.get(file);
+  if (pending !== undefined) return pending;
+  const run = fillSessionCacheEntry(file, preset, title, createdAt, header, logger, readTranscript, size, mtimeMs);
+  inflightFills.set(file, run);
+  try {
+    return await run;
+  } finally {
+    if (inflightFills.get(file) === run) inflightFills.delete(file);
+  }
+}
+
+async function fillSessionCacheEntry(
+  file: string,
+  preset: string | null,
+  title: string | undefined,
+  createdAt: number,
+  header: SessionHeader,
+  logger: { warn: (message: string) => void },
+  readTranscript: TranscriptReader,
+  size: number,
+  mtimeMs: number,
+): Promise<SessionEvent[]> {
+  traceParse(file);
+  const { messages, modelChanges } = await readTranscript(file);
+  const replayed = replayOmpTranscript(messages, title, createdAt, modelChanges);
+  const events =
+    preset !== undefined && isPresetName(preset)
+      ? [...permissionEventsFor(preset, createdAt), ...replayed].map((event, index) => ({ ...event, seq: SessionSeq(index) }))
+      : replayed;
+  let stored: SessionEvent[];
+  try {
+    stored = validateStoredEvents(header, events);
+    assertContiguous(header.id, stored, 0);
+  } catch (error) {
+    // A malformed replay degrades that file's cold reads to an empty log
+    // until its (size, mtime) changes — fail-soft, never the caller's boot.
+    logger.warn(`omp persistence: replay of "${file}" failed storage validation; serving empty log (${String(error)})`);
+    stored = [];
+  }
+  sessionCache.set(file, { size, mtimeMs, preset, messages, events: stored });
+  return stored;
+}
 
 /**
  * One open channel onto an OMP-indexed session's replayed log. Read handles
@@ -184,51 +288,19 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
   }
 
   /**
-   * The full replayed Dash event log for one indexed session (memoized on
-   * (size, mtime, preset)), run through the shared storage validation and
-   * frozen so read handles may label it `shared-frozen`. When the index
-   * records a permission preset, the three Dash permission events are
-   * synthesized at the HEAD — OMP's transcript never records them.
+   * The full replayed Dash event log for one indexed session, served from the
+   * unified {@link SessionCacheEntry} store (L1 parse + L2 replay behind one
+   * map, single-flight). See {@link eventsForSessionCache}.
    */
   private async eventsOf(row: SessionRow): Promise<SessionEvent[]> {
-    let size: number;
-    let mtimeMs: number;
-    try {
-      const stats = statSync(row.session_file);
-      size = stats.size;
-      mtimeMs = stats.mtimeMs;
-    } catch {
-      return [];
-    }
-    const preset = row.permission_preset;
-    const cached = logCache.get(row.session_file);
-    if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs && cached.preset === preset) {
-      return cached.events;
-    }
-    const transcript = (await readOmpTranscriptSdk(row.session_file)) ?? readOmpTranscript(row.session_file);
-    const { messages, modelChanges } = transcript;
-    const replayed = replayOmpTranscript(messages, row.title ?? undefined, row.created_at, modelChanges);
-    const events =
-      preset !== undefined && isPresetName(preset)
-        ? [...permissionEventsFor(preset, row.created_at), ...replayed].map((event, index) => ({
-            ...event,
-            seq: SessionSeq(index),
-          }))
-        : replayed;
-    let stored: SessionEvent[];
-    try {
-      stored = validateStoredEvents(this.headerOf(row), events);
-      assertContiguous(this.headerOf(row).id, stored, 0);
-    } catch (error) {
-      // A malformed replay degrades that file's cold reads to an empty log
-      // until its (size, mtime) changes — fail-soft, never the caller's boot.
-      this.ctx.logger.warn(
-        `omp persistence: replay of "${row.session_file}" failed storage validation; serving empty log (${String(error)})`,
-      );
-      stored = [];
-    }
-    logCache.set(row.session_file, { size, mtimeMs, preset, events: stored });
-    return stored;
+    return eventsForSessionCache({
+      file: row.session_file,
+      preset: row.permission_preset,
+      title: row.title ?? undefined,
+      createdAt: row.created_at,
+      header: this.headerOf(row),
+      logger: this.ctx.logger,
+    });
   }
 
   async list(options?: SessionPersistenceListOptions): Promise<readonly SessionPersistenceSnapshot[]> {

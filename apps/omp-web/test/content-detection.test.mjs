@@ -25,7 +25,7 @@ function fixture(dir, name) {
     JSON.stringify({ type: "title", title: "t", sessionId: name }),
     JSON.stringify({ type: "session", sessionId: name, cwd: dir }),
     JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "history prompt" }] } }),
-    JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "history reply" }] } }),
+    JSON.stringify({ type: "message", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-pro", content: [{ type: "text", text: "history reply" }] } }),
   ].join("\n") + "\n");
   return file;
 }

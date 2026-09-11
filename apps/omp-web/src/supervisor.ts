@@ -17,7 +17,6 @@ import { SessionPreparation, SessionSeq, type Session, type SessionEvent } from 
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { readOmpTranscript, scanForeignWriters } from "./omp-store.js";
 import { replayOmpTranscript } from "./replay.js";
-import { renderSystemPromptForFile } from "./sdk-client.js";
 import { getBridgeStore } from "./store/index.js";
 import { FILE_FOLLOW_INTERVAL_MS, SHADOW_TTL_MS, TRANSITION_FOLLOW_INTERVAL_MS } from "./knobs.js";
 
@@ -352,10 +351,7 @@ export class Supervisor {
     }
     const row = getBridgeStore()?.byFile(entry.file);
     const { messages, modelChanges } = readOmpTranscript(entry.file);
-    // Cold scan: best-effort system prompt render (fail-soft, ~2s on a cold
-    // session). A failure leaves it undefined and the shadow still materializes.
-    const systemPrompt = await renderSystemPromptForFile(entry.file);
-    const seed = replayOmpTranscript(messages, entry.title ?? row?.title ?? undefined, entry.createdAt ?? row?.created_at, modelChanges, systemPrompt);
+    const seed = replayOmpTranscript(messages, entry.title ?? row?.title ?? undefined, entry.createdAt ?? row?.created_at, modelChanges);
     try {
       const preparation = await SessionPreparation.create(
         this.sessions.prepare(id, {

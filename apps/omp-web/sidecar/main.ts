@@ -55,8 +55,8 @@ let nextHandle = 0;
  * — the default id ("Main") collides whenever a second session initializes
  * while a first is still registered, failing with `Agent "Main" was replaced
  * during session initialization` (upstream changelog: embedders pass a unique
- * id / private registry for exactly this). Unique ids keep live sessions and
- * cold `forFile` renders out of each other's way; `AgentRegistry.global().list()`
+ * id / private registry for exactly this). Unique ids keep concurrent live
+ * sessions out of each other's way; `AgentRegistry.global().list()`
  * consumers here filter `kind === "sub"`, so these roster entries never leak
  * into the subagents surface.
  */
@@ -234,34 +234,6 @@ const table: Record<string, Handler> = {
     const blocks = session.systemPrompt ?? session.state?.systemPrompt ?? [];
     const text = Array.isArray(blocks) ? blocks.join("\n\n") : String(blocks ?? "");
     return { systemPrompt: text };
-  },
-
-  // Render a cold session's system prompt from its transcript file. Deliberately
-  // OUTSIDE the handle pool: a throwaway AgentSession is opened, refreshed, and
-  // disposed without ever being hold()-ed, so it cannot collide with live handles.
-  "session.systemPrompt.forFile": async ({ file }: any) => {
-    const manager = await SessionManager.open(file, undefined, undefined, { suppressBreadcrumb: true });
-    try {
-      // Unique registry identity: a cold render must not collide with (or
-      // evict) a live session's roster entry (see nextAgentId).
-      const { session } = await createAgentSession({ sessionManager: manager, agentId: nextAgentId() });
-      try {
-        await (session as any).refreshBaseSystemPrompt();
-        const blocks = (session as any).systemPrompt ?? [];
-        const text = Array.isArray(blocks) ? blocks.join("\n\n") : String(blocks ?? "");
-        return { systemPrompt: text };
-      } finally {
-        // Read-only render: suppress the `session_exit` record that dispose()
-        // otherwise appends when the transcript has assistant messages. Drop
-        // the manager's retained entries first so the exit-record gate sees an
-        // empty journal, then dispose() runs its full MCP/worker teardown
-        // without writing to the transcript file.
-        manager.releaseRetainedEntries();
-        await (session as any).dispose();
-      }
-    } finally {
-      await manager.close().catch(() => {});
-    }
   },
 
   // get_session_stats parity (live sessions)

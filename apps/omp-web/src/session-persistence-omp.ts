@@ -212,6 +212,8 @@ function diskFilePath(dshId: string): string {
 const diskDirty = new Set<string>();
 let diskFlushTimer: ReturnType<typeof setTimeout> | null = null;
 let swept = false;
+/** Diagnostic counter: disk-read attempts in {@link adoptFromDisk} (test seam). */
+let diskReadCount = 0;
 
 /** Write one entry to its disk file atomically (tmp + rename). */
 function writeDiskEntry(entry: SessionCacheEntry): void {
@@ -277,6 +279,7 @@ function adoptFromDisk(
   const p = policy();
   if (!p.diskEnabled || p.diskDir === "") return undefined;
   ensureDiskSweep();
+  diskReadCount += 1;
   let raw: string;
   try {
     raw = readFileSync(diskFilePath(dshId), "utf8");
@@ -315,7 +318,7 @@ function adoptFromDisk(
   }
   // Adopt: L1 (messages) is write-only dead weight, so it starts empty and is
   // re-derived on the next growth ingest.
-  sessionCache.set(file, {
+  storeEntryAndEvict(file, {
     size,
     mtimeMs,
     preset,
@@ -323,7 +326,7 @@ function adoptFromDisk(
     events: adopted,
     cursor: { lastSeq: adopted.length, size, mtimeMs },
     dshId,
-    lastViewedAt: 0,
+    lastViewedAt: Date.now(),
   });
   return adopted;
 }
@@ -332,6 +335,12 @@ function adoptFromDisk(
 function isExemptFromEviction(file: string): boolean {
   if (inflightFills.has(file)) return true;
   return supervisor.isFollowed(file);
+}
+
+/** Shared store-then-evict: set an entry and enforce caps, protecting it from its own round. */
+function storeEntryAndEvict(file: string, entry: SessionCacheEntry): void {
+  sessionCache.set(file, entry);
+  evictColdest(file);
 }
 
 /** Enforce the in-memory caps, coldest first; flush-before-evict, skip exempt entries. */
@@ -405,7 +414,8 @@ export function touchSessionCacheEntry(file: string): void {
 /** Test/diagnostic seam: override cache-policy bits in-process (pass null to reset). */
 export function _setCachePolicyForTest(override: Partial<CachePolicy> | null): void {
   policyOverride = override;
-  swept = false;
+  // NOTE: `swept` is intentionally NOT reset here — the boot sweep is once per
+  // process (production-faithful); tests that need a sweep use the direct seam.
   if (diskFlushTimer !== null) {
     clearTimeout(diskFlushTimer);
     diskFlushTimer = null;
@@ -432,6 +442,16 @@ export function _flushDiskForTest(): void {
 /** Test/diagnostic seam: run the disk-dir atime sweep synchronously. */
 export function _sweepReplayCacheDirForTest(): void {
   sweepReplayCacheDir();
+}
+
+/** Test/diagnostic seam: number of disk-read attempts (adoption misses + hits). */
+export function _getDiskReadCountForTest(): number {
+  return diskReadCount;
+}
+
+/** Test/diagnostic seam: current in-memory cache size. */
+export function _cacheSizeForTest(): number {
+  return sessionCache.size;
 }
 
 /** The L1 transcript reader: SDK-first, JSONL fallback. Injectable for tests. */
@@ -479,11 +499,11 @@ export async function eventsForSessionCache(fill: SessionCacheFill): Promise<Ses
   if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs && cached.preset === preset) {
     return cached.events;
   }
+  const pending = inflightFills.get(file);
+  if (pending !== undefined) return pending;
   // Disk tier (cold miss + boot warm): adopt a matching, valid disk replay.
   const adopted = adoptFromDisk(file, size, mtimeMs, preset, header, String(header.id));
   if (adopted !== undefined) return adopted;
-  const pending = inflightFills.get(file);
-  if (pending !== undefined) return pending;
   const run = fillSessionCacheEntry(file, preset, title, createdAt, header, logger, readTranscript, size, mtimeMs);
   inflightFills.set(file, run);
   try {
@@ -528,8 +548,7 @@ function storeValidated(
     logger.warn(`omp persistence: replay of "${file}" failed storage validation; serving empty log (${String(error)})`);
     stored = [];
   }
-  const previous = sessionCache.get(file);
-  sessionCache.set(file, {
+  storeEntryAndEvict(file, {
     size,
     mtimeMs,
     preset,
@@ -537,9 +556,8 @@ function storeValidated(
     events: stored,
     cursor: { lastSeq: stored.length, size, mtimeMs },
     dshId: String(header.id),
-    lastViewedAt: previous?.lastViewedAt ?? 0,
+    lastViewedAt: Date.now(),
   });
-  evictColdest(file);
   return stored;
 }
 

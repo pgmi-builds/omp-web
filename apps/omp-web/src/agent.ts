@@ -39,11 +39,11 @@ import type {
   UserMessage,
 } from "@deepseek-ai/dsh-session";
 import type { AssistantMessage, AssistantStreamRecord, ContentBlock, StreamChunk, TokenUsage } from "@deepseek-ai/dsh-llm";
-import { LlmAttemptId, ToolCallId, QUOTA_EXCEEDED_CODE, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { LlmAttemptId, ToolCallId, QUOTA_EXCEEDED_CODE, createAssistantMessage, createSystemMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { createScope, type Scope } from "@deepseek-ai/dsh-scope";
 import type { ApprovalOutcome, ApprovalService } from "@deepseek-ai/dsh-user-approval";
 import type { OmpAssistantMessageEvent, OmpContentBlock, OmpMessage, RpcEvent } from "./rpc-types.js";
-import type { OmpSdkClient } from "./sdk-client.js";
+import type { OmpAgentRpc } from "./lazy-rpc.js";
 // Type-only: pulls dsh-commands' `Context.commands` augmentation into this
 // compilation (the runtime service is mounted by the base bundle).
 import type {} from "@deepseek-ai/dsh-commands";
@@ -310,7 +310,7 @@ export class OmpAgent implements Agent {
   readonly session: Session;
   readonly inbox: Inbox;
   readonly ctx: Context;
-  readonly #rpc: OmpSdkClient;
+  readonly #rpc: OmpAgentRpc;
   readonly #loopCtx: Context;
   readonly #scope: Scope;
   readonly #dispatch: AgentEventDispatch;
@@ -353,8 +353,10 @@ export class OmpAgent implements Agent {
   readonly #onIdleExit: (() => void) | undefined;
   #idleExitTimer: NodeJS.Timeout | undefined = undefined;
   #disposed = false;
+  /** One-shot guard for the first-turn session-identity commit (#bootstrapSessionIdentity). */
+  #sessionIdentityCommitted = false;
 
-  constructor(loopCtx: Context, id: SessionId, options: AgentOptions, session: Session, rpc: OmpSdkClient, onIdleExit?: () => void) {
+  constructor(loopCtx: Context, id: SessionId, options: AgentOptions, session: Session, rpc: OmpAgentRpc, onIdleExit?: () => void) {
     this.#loopCtx = loopCtx;
     this.id = id;
     this.options = options;
@@ -368,12 +370,12 @@ export class OmpAgent implements Agent {
     this.#lastTurn = session.snapshotEvents().findLast((event) => event.type === "turn/start")?.data.turn ?? 0;
     rpc.on((event) => this.#handleEvent(event));
     rpc.onFailure((error) => this.#fail(error));
-    // OMP is single-mode: stamp the live session's preset so the chat-header
-    // badge resolves it from events even for a scan-native session resumed
-    // under a header that predates the roster. Idempotent — skip when present.
-    if (!session.snapshotEvents().some((event) => event.type === "agent-preset/selected" && event.data?.agentPreset === "omp")) {
-      session.append("agent-preset/selected", { agentPreset: "omp" });
-    }
+    // Session-identity events (the agent-preset stamp and the surface-node-0
+    // system prompt) are committed on the FIRST turn by
+    // #bootstrapSessionIdentity — only once the lazy child actually exists —
+    // so a freshly created session announces completely blank, exactly like
+    // the native agent-loop factory's: the backend takes zero part in the
+    // UI's browser-local new-session draft.
     // `/permission` cannot work here: OMP pins `--approval-mode` at launch and
     // no RPC changes it mid-session. Registering the SAME name on this agent's
     // own scope (a command-injected child of `agent.ctx`) SHADOWS the global
@@ -506,15 +508,66 @@ export class OmpAgent implements Agent {
   #deliverPrompt(message: UserMessage): void {
     if (this.#disposed) return;
     trace(`#deliverPrompt turn=${this.#dashTurn + 1} text="${userMessageText(message).slice(0, 40)}"`);
-    this.#openTurn(message);
-    const text = userMessageText(message);
+    // Reserve the turn synchronously: busy-flag semantics stay identical to
+    // the eager line (a second delivery during the cold start queues
+    // remotely), but NOTHING is appended yet — the log stays empty until the
+    // lazy child exists, so a failed cold start leaves no orphan turn.
+    this.#reserveTurn();
     clearTimeout(this.#idleExitTimer);
     this.#idleExitTimer = undefined;
-    supervisor.reportUserText(String(this.id), text);
+    supervisor.reportUserText(String(this.id), userMessageText(message));
     this.#beginActivity();
-    void this.#syncModelSelection().finally(() => {
-      void this.#rpc.prompt(text).catch((error) => this.#fail(error));
-    });
+    void this.#startTurn(message);
+  }
+
+  /**
+   * Cold-start path for one reserved turn: spawn the lazy child (first prompt
+   * only), commit the session-identity events ahead of the turn (surface node
+   * 0 = system prompt — the native loop's step() ordering), sync the model,
+   * then append turn/start + user/message and dispatch. A failed cold start
+   * synthesizes the failed turn (turn/end with the error reason) so the UI's
+   * error path renders it, then unwinds the reservation.
+   */
+  async #startTurn(message: UserMessage): Promise<void> {
+    try {
+      await this.#rpc.ensureStarted();
+      await this.#bootstrapSessionIdentity();
+      await this.#syncModelSelection();
+    } catch (error) {
+      trace(`#startTurn cold start failed: ${String(error)}`);
+      if (this.#turnOpen) {
+        this.session.append("turn/start", { turn: this.#dashTurn });
+        this.session.append("user/message", message, { surfaceOp: "append" });
+        this.#closeTurn({ kind: "error", error: { message: String(error), code: "UNKNOWN" } });
+      }
+      this.#endActivity();
+      return;
+    }
+    if (this.#disposed) return;
+    this.session.append("turn/start", { turn: this.#dashTurn });
+    this.session.append("user/message", message, { surfaceOp: "append" });
+    void this.#rpc.prompt(userMessageText(message)).catch((error) => this.#fail(error));
+  }
+
+  /**
+   * One-shot first-turn identity commit, right after the lazy child spawns:
+   * the agent-preset stamp (idempotent) and the live system prompt as surface
+   * node 0 — the same shape the cold replay emits and the same position the
+   * native loop's step() commits it. No-op when the seed already carries both
+   * (a resumed session replayed from its transcript).
+   */
+  async #bootstrapSessionIdentity(): Promise<void> {
+    if (this.#sessionIdentityCommitted) return;
+    this.#sessionIdentityCommitted = true;
+    if (!this.session.snapshotEvents().some((event) => event.type === "agent-preset/selected" && event.data?.agentPreset === "omp")) {
+      this.session.append("agent-preset/selected", { agentPreset: "omp" });
+    }
+    if (!this.session.snapshotEvents().some((event) => event.type === "system/message")) {
+      const systemPrompt = await this.#rpc.getSystemPrompt();
+      if (systemPrompt !== undefined && systemPrompt !== "") {
+        this.session.append("system/message", { turn: 0, step: 0, message: createSystemMessage(systemPrompt, "omp-web") }, { surfaceOp: "append" });
+      }
+    }
   }
 
   /**
@@ -623,12 +676,24 @@ export class OmpAgent implements Agent {
     store.updateModel(String(this.session.id), target.provider, target.model);
   }
 
-  #openTurn(message: UserMessage, localUser = true): void {
-    trace(`#openTurn turnOpen=${this.#turnOpen} -> turn=${this.#dashTurn + 1} localUser=${localUser}`);
+  /**
+   * Reserve a turn WITHOUT appending anything: the prompt path reserves
+   * synchronously, then commits turn/start + user/message only after the lazy
+   * cold start (#startTurn). #openTurn keeps the eager append for paths that
+   * run against an already-live child (#bridgeRemoteUser echoes).
+   */
+  #reserveTurn(): void {
     if (this.#turnOpen) return;
     this.#dashTurn = ++this.#lastTurn;
     this.#step = 0;
     this.#turnOpen = true;
+    this.#localUserPending = true;
+  }
+
+  #openTurn(message: UserMessage, localUser = true): void {
+    trace(`#openTurn turnOpen=${this.#turnOpen} -> turn=${this.#dashTurn + 1} localUser=${localUser}`);
+    if (this.#turnOpen) return;
+    this.#reserveTurn();
     this.#localUserPending = localUser;
     this.session.append("turn/start", { turn: this.#dashTurn });
     this.session.append("user/message", message, { surfaceOp: "append" });
@@ -730,6 +795,10 @@ export class OmpAgent implements Agent {
    */
   async #revalidateIdleExit(): Promise<void> {
     if (this.#disposed || this.#streaming) return this.#armIdleExit();
+    // Never-spawned draft: no child exists and no work is possible — drop the
+    // exit instead of re-arming timers or querying the rpc (passive queries
+    // must never conjure a child).
+    if (!this.#rpc.spawned) return;
     if (this.#remoteQueue.some((entry) => !entry.sent)) return this.#armIdleExit();
     if (this.#approvalAborts.size > 0) return this.#armIdleExit();
     try {

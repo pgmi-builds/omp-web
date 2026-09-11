@@ -332,7 +332,21 @@ export class OmpSdkClient {
     return ok("new_session");
   }
 
-  /** Dispose the session and release the shared sidecar. Idempotent. */
+  /**
+   * Lazy-surface parity: a real client is born live, so "ensure started" is a
+   * no-op (LazyOmpRpc implements the real deferred spawn behind the same
+   * OmpAgentRpc interface).
+   */
+  ensureStarted(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  /** Always true for a real client (see OmpAgentRpc.spawned). */
+  get spawned(): boolean {
+    return true;
+  }
+
+  /** Discard the current conversation and start a fresh session (same handle). */
   close(): void {
     if (this.#closed) return;
     this.#closed = true;

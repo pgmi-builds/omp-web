@@ -49,6 +49,21 @@ interface HeldSession {
 }
 const sessions = new Map<string, HeldSession>();
 let nextHandle = 0;
+/**
+ * Per-session agent identity for `createAgentSession`. The SDK's session init
+ * registers the top-level agent in the PROCESS-GLOBAL roster keyed by agent id
+ * — the default id ("Main") collides whenever a second session initializes
+ * while a first is still registered, failing with `Agent "Main" was replaced
+ * during session initialization` (upstream changelog: embedders pass a unique
+ * id / private registry for exactly this). Unique ids keep live sessions and
+ * cold `forFile` renders out of each other's way; `AgentRegistry.global().list()`
+ * consumers here filter `kind === "sub"`, so these roster entries never leak
+ * into the subagents surface.
+ */
+let nextAgentSeq = 0;
+function nextAgentId(): string {
+  return `omp-web-${process.pid}-${++nextAgentSeq}`;
+}
 
 function hold(session: HeldSession["session"]): string {
   const handle = `h${++nextHandle}`;
@@ -85,6 +100,8 @@ async function createSession(params: any): Promise<string> {
   if (params?.resumeFile) opts.sessionManager = SessionManager.open(params.resumeFile);
   else if (params?.persistence === "file") opts.sessionManager = SessionManager.create(params.cwd ?? process.cwd());
   else opts.sessionManager = SessionManager.inMemory();
+  // Unique registry identity per session (see nextAgentId).
+  opts.agentId = nextAgentId();
 
   const { session } = await createAgentSession(opts as any);
   return hold(session);
@@ -225,7 +242,9 @@ const table: Record<string, Handler> = {
   "session.systemPrompt.forFile": async ({ file }: any) => {
     const manager = await SessionManager.open(file, undefined, undefined, { suppressBreadcrumb: true });
     try {
-      const { session } = await createAgentSession({ sessionManager: manager });
+      // Unique registry identity: a cold render must not collide with (or
+      // evict) a live session's roster entry (see nextAgentId).
+      const { session } = await createAgentSession({ sessionManager: manager, agentId: nextAgentId() });
       try {
         await (session as any).refreshBaseSystemPrompt();
         const blocks = (session as any).systemPrompt ?? [];

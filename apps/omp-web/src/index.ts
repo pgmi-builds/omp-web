@@ -31,10 +31,10 @@ import type {
   ResumeAgentOptions,
 } from "@deepseek-ai/dsh-agent";
 import { emitAgentEvent } from "@deepseek-ai/dsh-agent";
-import { SessionPreparation, type Session, type SessionEvent, type SessionId } from "@deepseek-ai/dsh-session";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
-import { createSystemMessage } from "@deepseek-ai/dsh-llm";
+import { SessionPreparation, type Session, type SessionEvent, type SessionHeader, type SessionId } from "@deepseek-ai/dsh-session";
 import { OmpSdkClient } from "./sdk-client.js";
+import { LazyOmpRpc, type OmpAgentRpc } from "./lazy-rpc.js";
 import { OmpAgent } from "./agent.js";
 import { replayOmpMessages } from "./replay.js";
 import { OmpLlmAdapter } from "./adapter.js";
@@ -350,51 +350,32 @@ export class OmpProvider extends Service implements AgentFactory {
     const approvalMode = envMode ?? ompApprovalMode(preset);
     trace(`create id=${id} preset=${preset ?? "none"} approval-mode=${approvalMode}${envMode === undefined ? "" : " (env override)"}`);
 
-    // Spawn OMP and wait for the `ready` handshake.
-    const rpc = await OmpSdkClient.spawn(["--approval-mode", approvalMode], cwd);
+    // Backend takes ZERO part in the UI's browser-local new-session draft:
+    // no OMP child, no transcript, no index row, no session events — the
+    // session announces blank, exactly like the native agent-loop factory's
+    // in-process agent. The child materializes on the first prompt
+    // (LazyOmpRpc); adoptSpawnedChild writes the index row and the
+    // supervisor's held baseline at that moment, so a draft abandoned before
+    // the first prompt costs and leaves NOTHING server-side.
+    const rpc = new LazyOmpRpc(["--approval-mode", approvalMode], cwd);
+    const preparation = SessionPreparation.create(loopCtx.sessions.prepare(id, {
+      ...(options.seed === undefined ? {} : { seed: options.seed }),
+      ...(meta === undefined ? {} : { meta }),
+    }));
+    // The prepared header is the single source of truth for the row the
+    // first-spawn adoption writes: v2 folds header identity across
+    // live/listed/loaded observations, so created_at/cwd must be copied from
+    // it verbatim (an independent Date.now() would SOURCE_CONFLICT the id).
+    const header = preparation.session.header;
+    rpc.onSpawned((client) => {
+      void adoptSpawnedChild(id, header, client, preset);
+    });
 
-    try {
-      // The Dash session id and OMP's session id are UNRELATED (Dash mints
-      // `session-<uuid4>`, OMP its own uuidv7). Their pairing lives in the one
-      // per-session artifact the bridge owns inside OMP's store (webui.json):
-      // a Dash-id resume reads it back through the scan, and the preset
-      // travels with it for cold permission synthesis. Best-effort contract.
-      const state = await rpc.getState();
-
-      // Prepare the unpublished session FIRST (mirrors dsh-agent-loop's
-      // SessionPreparation): its stamped header is the single source of truth
-      // for the row below. v2 folds header identity across live/listed/loaded
-      // observations, so a row created_at from an independent Date.now() call
-      // would make every session/list observation conflict with the live one.
-      const preparation = SessionPreparation.create(loopCtx.sessions.prepare(id, {
-        ...(options.seed === undefined ? {} : { seed: options.seed }),
-        ...(meta === undefined ? {} : { meta }),
-      }));
-
-      if (state.sessionFile !== undefined) {
-        const store = getBridgeStore();
-        if (store !== undefined) {
-          const ompId = state.sessionId ?? sessionHeaderId(state.sessionFile);
-          if (ompId !== undefined) {
-            upsertCreated(store, {
-              ompSessionId: ompId,
-              sessionFile: state.sessionFile,
-              dshSessionId: id,
-              createdAt: preparation.session.header.createdAt,
-              cwd: preparation.session.header.cwd ?? cwd,
-              ...(preset === undefined ? {} : { preset }),
-            });
-          }
-        }
-      }
-
-      const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation.session, rpc, options.parentAgent, "startup", { enterSession: true, preparation });
-
-      return this.registerHeld(id, state.sessionFile ?? "", handle);
-    } catch (error) {
-      rpc.close();
-      throw error;
-    }
+    // Nothing can fail from the child here (none exists yet); the publish
+    // transaction below unwinds its own half-published state on failure — its
+    // catch calls rpc.close(), a no-op until the first prompt spawns.
+    const handle = await setupAndPublish(loopCtx, ownerCtx, id, options.agentOptions ?? {}, options.setup, preparation.session, rpc, options.parentAgent, "startup", { enterSession: true, preparation });
+    return this.registerHeld(id, "", handle);
   }
 
   async resume(ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle> {
@@ -582,6 +563,45 @@ export class OmpProvider extends Service implements AgentFactory {
  * module-level function (not a private method) because Cordis exposes the
  * provider through a tracing proxy, which breaks hard-private (`#`) receivers.
  */
+/**
+ * First-spawn adoption for a lazily created session: the OMP child exists only
+ * from the first prompt on, so the bridge index row and the supervisor's held
+ * baseline are written HERE instead of at create time. The row copies the
+ * prepared header's created_at/cwd verbatim — v2 folds header identity across
+ * live/listed/loaded observations, and an independent timestamp would make
+ * session/query throw SOURCE_CONFLICT for the id. Fail-soft: an adoption
+ * failure degrades that session's metadata (the next reconcile pass retries
+ * against the transcript), never the prompt itself.
+ */
+async function adoptSpawnedChild(
+  id: SessionId,
+  header: SessionHeader,
+  client: OmpSdkClient,
+  preset: string | undefined,
+): Promise<void> {
+  try {
+    const state = await client.getState();
+    const file = state.sessionFile;
+    if (file === undefined || file === "") return;
+    const store = getBridgeStore();
+    const ompId = state.sessionId ?? sessionHeaderId(file);
+    if (store !== undefined && ompId !== undefined) {
+      upsertCreated(store, {
+        ompSessionId: ompId,
+        sessionFile: file,
+        dshSessionId: String(id),
+        createdAt: header.createdAt,
+        cwd: header.cwd,
+        ...(preset === undefined ? {} : { preset }),
+      });
+    }
+    supervisor.onHeld(String(id), file);
+    trace(`adoptSpawnedChild id=${id} file=${file}`);
+  } catch (error) {
+    trace(`adoptSpawnedChild id=${id} failed: ${String(error)}`);
+  }
+}
+
 async function setupAndPublish(
   loopCtx: Context,
   ownerCtx: Context,
@@ -589,7 +609,7 @@ async function setupAndPublish(
   agentOptions: AgentOptions,
   setup: AgentSetup | undefined,
   session: Session,
-  rpc: OmpSdkClient,
+  rpc: OmpAgentRpc,
   parentAgent: Agent | undefined,
   source: "startup" | "resume",
   opts: { enterSession: boolean; preparation?: SessionPreparation },
@@ -606,16 +626,12 @@ async function setupAndPublish(
     // is false and the projection is reused (seq-continuous promotion).
     agent = new OmpAgent(loopCtx, id, agentOptions, session, rpc, () => idleExit?.());
 
-    // Surface node 0: stamp the live system prompt for a FRESH session (the
-    // 0.1.5 contract forbids `header.system` on request/header). Fail-soft —
-    // a replayed/resumed session already seeds its own `system/message`.
-    if (!session.snapshotEvents().some((event) => event.type === "system/message")) {
-      const liveSystemPrompt = await rpc.getSystemPrompt();
-      if (liveSystemPrompt !== undefined && liveSystemPrompt !== "") {
-        session.append("system/message", { turn: 0, step: 0, message: createSystemMessage(liveSystemPrompt, "omp-web") }, { surfaceOp: "append" });
-      }
-    }
-
+    // The live system prompt is NOT stamped here anymore: the eager append
+    // turned the UI's new-session draft into a non-blank session and broke
+    // the composer. It is committed on the first turn by OmpAgent's
+    // #bootstrapSessionIdentity, after the lazy child spawns — surface node 0
+    // ahead of turn/start, the native loop's step() ordering. A replayed or
+    // resumed session seeds its own system/message from the transcript.
 
     // Composition-only setup on the unpublished agent scope.
     const commit = await setup?.(agent.ctx, agent);

@@ -170,6 +170,11 @@ function systemMessageEvent(systemPrompt: string, time: number): SessionEvent {
     type: "system/message",
     seq: 0,
     time,
+    // Surface-eligible event: v2 seed validation rejects a surface-eligible
+    // event without its append marker — and with it the WHOLE replayed seed
+    // ("is surface-eligible and requires a surfaceOp marker"), serving an
+    // empty log. Same shape session.append stamps on the live path.
+    surfaceOp: "append",
     data: { turn: 0, step: 0, message: createSystemMessage(systemPrompt, "omp-web") },
   } as unknown as SessionEvent;
 }

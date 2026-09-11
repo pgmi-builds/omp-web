@@ -48,7 +48,7 @@ import {
   type SessionEvent,
   type SessionHeader,
 } from "@deepseek-ai/dsh-session";
-import { readOmpTranscript, readOmpTranscriptSdk, type OmpTranscript } from "./omp-store.js";
+import { readOmpTranscript, readOmpTranscriptSdk, type OmpModelChange, type OmpTranscript } from "./omp-store.js";
 import type { OmpMessage } from "./rpc-types.js";
 import { replayOmpTranscript } from "./replay.js";
 import { supervisor } from "./supervisor.js";
@@ -65,8 +65,15 @@ interface ProjectionCacheSlice {
   ): Promise<unknown>;
 }
 
+/** Content cursor: how far into the transcript this entry has ingested. */
+export interface SessionCacheCursor {
+  lastSeq: number;
+  size: number;
+  mtimeMs: number;
+}
+
 /** One transcript file's staged parse: L1 raw messages, L2 replayed events. */
-interface SessionCacheEntry {
+export interface SessionCacheEntry {
   size: number;
   mtimeMs: number;
   preset: string | null;
@@ -74,6 +81,8 @@ interface SessionCacheEntry {
   messages: OmpMessage[];
   /** L2: replayed + validated + frozen Dash event log. */
   events: SessionEvent[];
+  /** Ingest cursor (lastSeq/size/mtime) — moved from the supervisor's Entry. */
+  cursor: SessionCacheCursor;
 }
 
 /** THE single cache map for parsed transcript data, keyed by file path. */
@@ -89,6 +98,11 @@ const traceParse = (file: string): void => {
   parseSeq += 1;
   if (TRACE) process.stderr.write(`[omp-cache ${Date.now() % 1_000_000}] parse ${file} (seq ${parseSeq})\n`);
 };
+
+/** Test/diagnostic seam: total completed parses since process start. */
+export function getParseCount(): number {
+  return parseSeq;
+}
 
 /** The L1 transcript reader: SDK-first, JSONL fallback. Injectable for tests. */
 type TranscriptReader = (file: string) => Promise<OmpTranscript>;
@@ -139,6 +153,38 @@ export async function eventsForSessionCache(fill: SessionCacheFill): Promise<Ses
   }
 }
 
+function stageSessionCacheEntry(
+  file: string,
+  preset: string | null,
+  title: string | undefined,
+  createdAt: number,
+  header: SessionHeader,
+  logger: { warn: (message: string) => void },
+  messages: OmpMessage[],
+  modelChanges: OmpModelChange[],
+  size: number,
+  mtimeMs: number,
+): SessionEvent[] {
+  traceParse(file);
+  const replayed = replayOmpTranscript(messages, title, createdAt, modelChanges);
+  const events =
+    preset !== undefined && isPresetName(preset)
+      ? [...permissionEventsFor(preset, createdAt), ...replayed].map((event, index) => ({ ...event, seq: SessionSeq(index) }))
+      : replayed;
+  let stored: SessionEvent[];
+  try {
+    stored = validateStoredEvents(header, events);
+    assertContiguous(header.id, stored, 0);
+  } catch (error) {
+    // A malformed replay degrades that file's reads to an empty log until its
+    // (size, mtime) changes — fail-soft, never the caller's boot/tick.
+    logger.warn(`omp persistence: replay of "${file}" failed storage validation; serving empty log (${String(error)})`);
+    stored = [];
+  }
+  sessionCache.set(file, { size, mtimeMs, preset, messages, events: stored, cursor: { lastSeq: stored.length, size, mtimeMs } });
+  return stored;
+}
+
 async function fillSessionCacheEntry(
   file: string,
   preset: string | null,
@@ -150,25 +196,81 @@ async function fillSessionCacheEntry(
   size: number,
   mtimeMs: number,
 ): Promise<SessionEvent[]> {
-  traceParse(file);
   const { messages, modelChanges } = await readTranscript(file);
-  const replayed = replayOmpTranscript(messages, title, createdAt, modelChanges);
-  const events =
-    preset !== undefined && isPresetName(preset)
-      ? [...permissionEventsFor(preset, createdAt), ...replayed].map((event, index) => ({ ...event, seq: SessionSeq(index) }))
-      : replayed;
-  let stored: SessionEvent[];
+  return stageSessionCacheEntry(file, preset, title, createdAt, header, logger, messages, modelChanges, size, mtimeMs);
+}
+
+/** Read the live cache entry for a file (supervisor cursor access). */
+export function sessionCacheEntryOf(file: string): SessionCacheEntry | undefined {
+  return sessionCache.get(file);
+}
+
+/**
+ * The full replayed event log for a file (supervisor-facing). Resolves the
+ * index row when present for title/preset/header; otherwise synthesizes a
+ * minimal header from `id` so the fill still works before a row exists.
+ * Shares the one {@link SessionCacheEntry} fill path (single-flight).
+ */
+export async function eventsForSessionFile(
+  file: string,
+  id: string,
+  logger: { warn: (message: string) => void },
+): Promise<SessionEvent[]> {
+  const row = getBridgeStore()?.byFile(file);
+  return eventsForSessionCache({
+    file,
+    preset: row?.permission_preset ?? null,
+    title: row?.title ?? undefined,
+    createdAt: row?.created_at ?? 0,
+    header: row === undefined ? sessionHeaderForId(id) : sessionHeaderOf(row),
+    logger,
+  });
+}
+
+export function fillSessionCacheEntrySync(file: string, id: string, logger: { warn: (message: string) => void }): SessionEvent[] {
+  let size: number;
+  let mtimeMs: number;
   try {
-    stored = validateStoredEvents(header, events);
-    assertContiguous(header.id, stored, 0);
-  } catch (error) {
-    // A malformed replay degrades that file's cold reads to an empty log
-    // until its (size, mtime) changes — fail-soft, never the caller's boot.
-    logger.warn(`omp persistence: replay of "${file}" failed storage validation; serving empty log (${String(error)})`);
-    stored = [];
+    const stats = statSync(file);
+    size = stats.size;
+    mtimeMs = stats.mtimeMs;
+  } catch {
+    return [];
   }
-  sessionCache.set(file, { size, mtimeMs, preset, messages, events: stored });
-  return stored;
+  const row = getBridgeStore()?.byFile(file);
+  const preset = row?.permission_preset ?? null;
+  const cached = sessionCache.get(file);
+  if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs && cached.preset === preset) {
+    return cached.events;
+  }
+  const { messages, modelChanges } = readOmpTranscript(file);
+  const header = row === undefined ? sessionHeaderForId(id) : sessionHeaderOf(row);
+  return stageSessionCacheEntry(file, preset, row?.title ?? undefined, row?.created_at ?? 0, header, logger, messages, modelChanges, size, mtimeMs);
+}
+
+/**
+ * The supervisor's synchronous incremental ingest: stat the file against the
+ * entry's cursor and, on growth, re-fill (sync JSONL) and return ONLY the
+ * delta events past `cursor.lastSeq`. The fill advances the entry's cursor and
+ * swaps in the new frozen `events` array, so a teardown → cold-read with no
+ * further change re-serves the entry without a re-parse.
+ */
+export function ingestSessionFileGrowthSync(file: string, id: string, logger: { warn: (message: string) => void }): SessionEvent[] {
+  const cached = sessionCache.get(file);
+  const cursor = cached?.cursor;
+  if (cursor === undefined) return [];
+  let size: number;
+  let mtimeMs: number;
+  try {
+    const stats = statSync(file);
+    size = stats.size;
+    mtimeMs = stats.mtimeMs;
+  } catch {
+    return [];
+  }
+  if (size === cursor.size && mtimeMs === cursor.mtimeMs) return [];
+  const events = fillSessionCacheEntrySync(file, id, logger);
+  return events.slice(cursor.lastSeq);
 }
 
 /**
@@ -230,6 +332,28 @@ class OmpSessionHandle implements SessionHandle {
   }
 }
 
+/** Dash header for one indexed session (v2: `isSeeded` always false). */
+function sessionHeaderOf(row: SessionRow): SessionHeader {
+  return Object.freeze({
+    version: SESSION_FORMAT_VERSION,
+    id: SessionId(row.dsh_session_id),
+    createdAt: row.created_at,
+    isSeeded: false,
+    agentPreset: row.agent_preset ?? "omp",
+    ...(row.cwd === null ? {} : { cwd: row.cwd }),
+  });
+}
+
+/** A minimal header synthesized when a file is not (yet) in the index. */
+function sessionHeaderForId(id: string): SessionHeader {
+  return Object.freeze({
+    version: SESSION_FORMAT_VERSION,
+    id: SessionId(id),
+    createdAt: 0,
+    isSeeded: false,
+    agentPreset: "omp",
+  });
+}
 export class OmpUnionSessionPersistence extends SessionPersistence {
   constructor(ctx: Context) {
     super(ctx);
@@ -269,18 +393,8 @@ export class OmpUnionSessionPersistence extends SessionPersistence {
     return row;
   }
 
-  /** Dash header for one indexed session (v2: `isSeeded` always false). */
   private headerOf(row: SessionRow): SessionHeader {
-    return Object.freeze({
-      version: SESSION_FORMAT_VERSION,
-      id: SessionId(row.dsh_session_id),
-      createdAt: row.created_at,
-      isSeeded: false,
-      // OMP is single-mode: every session carries the one hardcoded preset
-      // (the index stores it; fall back defensively).
-      agentPreset: row.agent_preset ?? "omp",
-      ...(row.cwd === null ? {} : { cwd: row.cwd }),
-    });
+    return sessionHeaderOf(row);
   }
 
   private revisionOf(row: SessionRow) {

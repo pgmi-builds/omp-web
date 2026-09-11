@@ -326,6 +326,25 @@ export class OmpSdkClient {
     return ok("abort");
   }
 
+  /**
+   * Run OMP's own context compaction on the live session (the TUI /compact
+   * handler's exact call). Resolves when the compaction settles.
+   */
+  async compact(instructions?: string): Promise<RpcResponse> {
+    await this.#call("session.compact", instructions === undefined ? {} : { instructions });
+    return ok("compact");
+  }
+
+  /** Context-usage snapshot for pre/post compact metering (fail-soft). */
+  async contextUsage(): Promise<{ tokens?: number; percent?: number } | undefined> {
+    try {
+      const data = await this.#call<{ usage?: { tokens?: number; percent?: number } }>("session.contextUsage");
+      return data?.usage ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Discard the current conversation and start a fresh session (same handle). */
   async newSession(): Promise<RpcResponse> {
     await this.#call("session.new");

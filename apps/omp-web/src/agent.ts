@@ -46,7 +46,7 @@ import type { OmpAssistantMessageEvent, OmpContentBlock, OmpMessage, RpcEvent } 
 import type { OmpAgentRpc } from "./lazy-rpc.js";
 // Type-only: pulls dsh-commands' `Context.commands` augmentation into this
 // compilation (the runtime service is mounted by the base bundle).
-import type {} from "@deepseek-ai/dsh-commands";
+import type { CommandInvocation, CommandResult } from "@deepseek-ai/dsh-commands";
 import { supervisor } from "./supervisor.js";
 import { getBridgeStore } from "./store/index.js";
 
@@ -393,6 +393,19 @@ export class OmpAgent implements Agent {
         }),
       }),
     );
+    // `/compact` parity (route 1): OMP owns context compaction — the Dash log
+    // is only the UI's scrollback projection, so no compaction/* events are
+    // fabricated and the surface is never replaced. Shadowing the loop-owned
+    // global name keeps the (disabled) native pipeline from receiving it; the
+    // command node renders the lifecycle and outcome natively.
+    this.ctx.inject(["commands"], (cmdCtx) =>
+      cmdCtx.commands.register({
+        name: "compact",
+        description: "Compact the OMP session context (OMP-native compaction)",
+        input: { hint: "[instructions]" },
+        handler: (invocation) => this.#handleCompactCommand(invocation),
+      }),
+    );
   }
 
   get status(): AgentStatus {
@@ -570,6 +583,34 @@ export class OmpAgent implements Agent {
     }
   }
 
+  /**
+   * /compact handler (route 1): run OMP's own compaction on the live child
+   * and report its real metering as the command outcome. No compaction/*
+   * events are appended and the Dash surface is never replaced — the Dash log
+   * is the UI's scrollback projection; only OMP's own context shrinks.
+   */
+  async #handleCompactCommand(invocation: CommandInvocation): Promise<CommandResult> {
+    if (this.#disposed) return { kind: "error", text: "Session is disposed." } as const;
+    if (!this.#rpc.spawned) {
+      return { kind: "success", text: "Session context is empty — nothing to compact yet." } as const;
+    }
+    const instructions = invocation.rawInput.trim();
+    const before = await this.#rpc.contextUsage();
+    try {
+      await this.#rpc.compact(instructions === "" ? undefined : instructions);
+    } catch (error) {
+      return { kind: "error", text: `Compaction failed: ${String(error)}` } as const;
+    }
+    const after = await this.#rpc.contextUsage();
+    if (before?.tokens === undefined || after?.tokens === undefined) {
+      return { kind: "success", text: "Compaction complete." } as const;
+    }
+    const saved = before.tokens - after.tokens;
+    return {
+      kind: "success",
+      text: `Compaction complete. Context tokens: ${before.tokens.toLocaleString("en-US")} → ${after.tokens.toLocaleString("en-US")} (saved ${saved.toLocaleString("en-US")}).`,
+    } as const;
+  }
   /**
    * Queue a message for OMP-side delivery. `followUp` dispatches immediately
    * (state-safe whether or not OMP is streaming); `steer` dispatches now when

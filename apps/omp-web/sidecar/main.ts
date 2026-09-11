@@ -274,6 +274,23 @@ const table: Record<string, Handler> = {
     }
   },
 
+  // /compact parity: run the SDK's own context compaction on the held
+  // session. The TUI's /compact awaits compact() then prints the
+  // context-usage delta, so this resolves only when it settles.
+  "session.compact": async ({ handle, instructions }: any) => {
+    const session: any = await get(handle);
+    const text = typeof instructions === "string" && instructions.trim() !== "" ? instructions.trim() : undefined;
+    await session.compact(text);
+    return { compacted: true };
+  },
+
+  // Context-usage snapshot (sync SDK getter) — pre/post compact metering.
+  "session.contextUsage": async ({ handle }: any) => {
+    const session: any = await get(handle);
+    const usage = session.getContextUsage?.();
+    return { usage: usage ?? undefined };
+  },
+
   // get_subagents parity — SDK subagent registry exposure TBD; fail-soft.
   // Subagent registry: enumerate the session's own subagents (kind === "sub"
   // with parentId === this session's registry id). The sidecar's per-session

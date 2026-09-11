@@ -32,6 +32,8 @@ export interface OmpAgentRpc {
   prompt(message: string): Promise<unknown>;
   followUp(message: string): Promise<unknown>;
   steer(message: string): Promise<unknown>;
+  compact(instructions?: string): Promise<unknown>;
+  contextUsage(): Promise<{ tokens?: number; percent?: number } | undefined>;
   abort(): Promise<unknown>;
   /** Forces the child to exist (first prompt). Never rejects for being live. */
   ensureStarted(): Promise<void>;
@@ -138,6 +140,15 @@ export class LazyOmpRpc implements OmpAgentRpc {
 
   async steer(message: string): Promise<unknown> {
     return (await this.#ensure()).steer(message);
+  }
+
+  async compact(instructions?: string): Promise<unknown> {
+    return (await this.#ensure()).compact(instructions);
+  }
+
+  async contextUsage(): Promise<{ tokens?: number; percent?: number } | undefined> {
+    if (this.#client === undefined) return undefined;
+    return this.#client.contextUsage();
   }
 
   async abort(): Promise<unknown> {

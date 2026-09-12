@@ -13,7 +13,7 @@
  * The emitted events carry contiguous `seq` from 0 and safe-integer `time`
  * values, exactly what `Session`'s seed validator requires.
  */
-import { ToolCallId, createAssistantMessage, createSystemMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { ToolCallId, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionSeq, type SessionEvent, type TurnEndReason } from "@deepseek-ai/dsh-session";
 import type { OmpMessage } from "./rpc-types.js";
 import { convertContent, convertUsage, ompFailure } from "./agent.js";
@@ -160,46 +160,24 @@ export function replayOmpMessages(messages: OmpMessage[]): SessionEvent[] {
  * leading `session/title` event (so the sidebar title projection folds
  * immediately, pinned `user`-sourced so Dash's own generator never fights
  * OMP's title authority), a `request/header` event carrying the transcript's
- * last model (see {@link lastModelCall}) and, when supplied, its rendered
- * system prompt (`systemPrompt`), followed by the message replay,
+ * last model (see {@link lastModelCall}), followed by the message replay,
  * with contiguous `seq` renumbered from 0.
  */
-/** One synthesized `system/message` surface node (surface node 0) carrying the rendered OMP system prompt. */
-function systemMessageEvent(systemPrompt: string, time: number): SessionEvent {
-  return {
-    type: "system/message",
-    seq: 0,
-    time,
-    // Surface-eligible event: v2 seed validation rejects a surface-eligible
-    // event without its append marker — and with it the WHOLE replayed seed
-    // ("is surface-eligible and requires a surfaceOp marker"), serving an
-    // empty log. Same shape session.append stamps on the live path.
-    surfaceOp: "append",
-    data: { turn: 0, step: 0, message: createSystemMessage(systemPrompt, "omp-web") },
-  } as unknown as SessionEvent;
-}
 
 export function replayOmpTranscript(
   messages: OmpMessage[],
   title?: string,
   titleTime?: number,
   modelChanges?: OmpModelChange[],
-  systemPrompt?: string,
 ): SessionEvent[] {
   const replayed = replayOmpMessages(messages);
   const config = lastRestorableModel(modelChanges ?? []) ?? lastModelCall(messages);
   const baseTime = replayed[0]?.time ?? Date.now();
-  // The 0.1.5 surface contract forbids `header.system` on `request/header`
-  // (surface.ts throws); the system prompt rides its own `system/message` node.
-  const systemNode = systemPrompt === undefined ? [] : [systemMessageEvent(systemPrompt, baseTime)];
   if (title === undefined || title.length === 0) {
     if (config === undefined) {
-      return systemNode.length === 0
-        ? replayed
-        : [...systemNode, ...replayed].map((event, index) => ({ ...event, seq: SessionSeq(index) }));
+      return replayed;
     }
     return [
-      ...systemNode,
       {
         type: "request/header",
         seq: 0,
@@ -216,7 +194,6 @@ export function replayOmpTranscript(
       time: titleTime ?? baseTime,
       data: { title, messageSeqs: [], source: { kind: "user" } },
     } as unknown as SessionEvent,
-    ...systemNode,
     ...(config === undefined
       ? []
       : [

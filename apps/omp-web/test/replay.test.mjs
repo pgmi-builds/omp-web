@@ -44,18 +44,14 @@ test("missing timestamps fall back to a monotonic now-base", () => {
   assert.ok(events[0].time > 0);
 });
 
-test("replayOmpTranscript emits system prompt as a system/message node (0.1.5 surface contract)", () => {
+test("replayOmpTranscript emits no system prompt node (cold replay is JSONL-faithful)", () => {
   const modelChanges = [{ model: "deepseek/deepseek-v4-pro", role: "default" }];
-  const events = replayOmpTranscript([], undefined, undefined, modelChanges, "RENDERED SYSTEM PROMPT");
-  const systemNode = events.find((e) => e.type === "system/message");
-  assert.ok(systemNode !== undefined, "system/message present");
-  assert.equal(systemNode.data.message.role, "system");
-  assert.ok(systemNode.data.message.content.some((b) => b.type === "text" && b.text === "RENDERED SYSTEM PROMPT"), "system text carried");
+  const events = replayOmpTranscript([], undefined, undefined, modelChanges);
+  // Cold replay must contain NO system/message — the OMP JSONL records no
+  // system prompt, so the static replay line emits none (RPC is the only emitter).
+  assert.equal(events.find((e) => e.type === "system/message"), undefined, "no system/message in cold replay");
   const header = events.find((e) => e.type === "request/header");
   assert.ok(header !== undefined, "request/header present");
   assert.equal(header.data.reason, "resume");
   assert.equal(header.data.header.system, undefined, "header must omit system (0.1.5 contract)");
-  // absent when no system prompt is supplied
-  const bare = replayOmpTranscript([], undefined, undefined, modelChanges);
-  assert.equal(bare.find((e) => e.type === "system/message"), undefined);
 });

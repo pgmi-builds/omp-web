@@ -565,9 +565,12 @@ export class OmpAgent implements Agent {
   /**
    * One-shot first-turn identity commit, right after the lazy child spawns:
    * the agent-preset stamp (idempotent) and the live system prompt as surface
-   * node 0 — the same shape the cold replay emits and the same position the
-   * native loop's step() commits it. No-op when the seed already carries both
-   * (a resumed session replayed from its transcript).
+   * node 0. This is now the ONLY system-prompt emitter — cold replay emits
+   * none (the OMP JSONL never records a system prompt), so a resumed session
+   * gets the RPC prompt appended immediately before its first live
+   * `turn/start` (timeline-tail semantics), while a fresh session gets it as
+   * node 0 (that render IS turn-1). The guard — skip when the seed already
+   * carries a `system/message` — stays.
    */
   async #bootstrapSessionIdentity(): Promise<void> {
     if (this.#sessionIdentityCommitted) return;

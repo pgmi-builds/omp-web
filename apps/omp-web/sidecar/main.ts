@@ -55,8 +55,8 @@ let nextHandle = 0;
  * — the default id ("Main") collides whenever a second session initializes
  * while a first is still registered, failing with `Agent "Main" was replaced
  * during session initialization` (upstream changelog: embedders pass a unique
- * id / private registry for exactly this). Unique ids keep live sessions and
- * cold `forFile` renders out of each other's way; `AgentRegistry.global().list()`
+ * id / private registry for exactly this). Unique ids keep concurrent live
+ * sessions out of each other's way; `AgentRegistry.global().list()`
  * consumers here filter `kind === "sub"`, so these roster entries never leak
  * into the subagents surface.
  */
@@ -97,10 +97,11 @@ async function createSession(params: any): Promise<string> {
   if (params?.appendSystemPrompt !== undefined) opts.appendSystemPrompt = params.appendSystemPrompt;
   // approval parity with `omp --approval-mode`: yolo = fully auto-approved.
   if (params?.approvalMode === "yolo") opts.autoApprove = true;
-  if (params?.resumeFile) opts.sessionManager = SessionManager.open(params.resumeFile);
-  else if (params?.persistence === "file") opts.sessionManager = SessionManager.create(params.cwd ?? process.cwd());
-  else opts.sessionManager = SessionManager.inMemory();
-  // Unique registry identity per session (see nextAgentId).
+  // omp SDK >= 18.1 made the SessionManager constructors async (they return
+  // promises); await keeps compatibility with the older sync surface too.
+  if (params?.resumeFile) opts.sessionManager = await SessionManager.open(params.resumeFile);
+  else if (params?.persistence === "file") opts.sessionManager = await SessionManager.create(params.cwd ?? process.cwd());
+  else opts.sessionManager = await SessionManager.inMemory();
   opts.agentId = nextAgentId();
 
   const { session } = await createAgentSession(opts as any);
@@ -234,34 +235,6 @@ const table: Record<string, Handler> = {
     const blocks = session.systemPrompt ?? session.state?.systemPrompt ?? [];
     const text = Array.isArray(blocks) ? blocks.join("\n\n") : String(blocks ?? "");
     return { systemPrompt: text };
-  },
-
-  // Render a cold session's system prompt from its transcript file. Deliberately
-  // OUTSIDE the handle pool: a throwaway AgentSession is opened, refreshed, and
-  // disposed without ever being hold()-ed, so it cannot collide with live handles.
-  "session.systemPrompt.forFile": async ({ file }: any) => {
-    const manager = await SessionManager.open(file, undefined, undefined, { suppressBreadcrumb: true });
-    try {
-      // Unique registry identity: a cold render must not collide with (or
-      // evict) a live session's roster entry (see nextAgentId).
-      const { session } = await createAgentSession({ sessionManager: manager, agentId: nextAgentId() });
-      try {
-        await (session as any).refreshBaseSystemPrompt();
-        const blocks = (session as any).systemPrompt ?? [];
-        const text = Array.isArray(blocks) ? blocks.join("\n\n") : String(blocks ?? "");
-        return { systemPrompt: text };
-      } finally {
-        // Read-only render: suppress the `session_exit` record that dispose()
-        // otherwise appends when the transcript has assistant messages. Drop
-        // the manager's retained entries first so the exit-record gate sees an
-        // empty journal, then dispose() runs its full MCP/worker teardown
-        // without writing to the transcript file.
-        manager.releaseRetainedEntries();
-        await (session as any).dispose();
-      }
-    } finally {
-      await manager.close().catch(() => {});
-    }
   },
 
   // get_session_stats parity (live sessions)

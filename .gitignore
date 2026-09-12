@@ -37,3 +37,4 @@ Thumbs.db
 
 --- deprecated apps (kept on disk for reference, never tracked) ---
 archived/
+.superpowers/

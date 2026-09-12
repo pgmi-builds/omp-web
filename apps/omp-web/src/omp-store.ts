@@ -117,27 +117,15 @@ export function readOmpTranscript(path: string): OmpTranscript {
   return { messages, modelChanges };
 }
 
-/** Memoized SDK transcript reads, keyed by file + (size, mtime). */
-const transcriptSdkCache = new Map<string, { size: number; mtimeMs: number; value: OmpTranscript }>();
-
 /**
  * Read one OMP transcript through the shared sidecar's SDK reader
- * (`loadSessionMessagesReadOnly` + a lenient `model_change` recovery), memoized
- * on (size, mtime). Returns `undefined` on any sidecar/SDK failure so callers
- * fall back to {@link readOmpTranscript} — fail-soft, never blocking replay.
+ * (`loadSessionMessagesReadOnly` + a lenient `model_change` recovery). Pure
+ * read — no stat, no cache; the persistence layer's unified
+ * {@link SessionCacheEntry} owns freshness and memoization. Returns
+ * `undefined` on any sidecar/SDK failure so callers fall back to
+ * {@link readOmpTranscript} — fail-soft, never blocking replay.
  */
 export async function readOmpTranscriptSdk(path: string): Promise<OmpTranscript | undefined> {
-  let size: number;
-  let mtimeMs: number;
-  try {
-    const stats = statSync(path);
-    size = stats.size;
-    mtimeMs = stats.mtimeMs;
-  } catch {
-    return undefined;
-  }
-  const cached = transcriptSdkCache.get(path);
-  if (cached !== undefined && cached.size === size && cached.mtimeMs === mtimeMs) return cached.value;
   try {
     const data = await callShared<methods.SessionsMessagesReadOnlyResult>("sessions.messagesReadOnly", { file: path });
     const messages: OmpMessage[] = [];
@@ -162,9 +150,7 @@ export async function readOmpTranscriptSdk(path: string): Promise<OmpTranscript 
         modelChanges.push({ model, role: typeof c["role"] === "string" ? c["role"] : undefined });
       }
     }
-    const value: OmpTranscript = { messages, modelChanges };
-    transcriptSdkCache.set(path, { size, mtimeMs, value });
-    return value;
+    return { messages, modelChanges };
   } catch {
     return undefined;
   }

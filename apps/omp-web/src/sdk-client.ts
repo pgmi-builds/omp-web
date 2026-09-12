@@ -89,26 +89,6 @@ export async function callShared<T = unknown>(method: string, params?: unknown):
   }
 }
 
-/**
- * Render a COLD session's base system prompt from its transcript file, outside
- * any live handle. Acquires the shared sidecar, calls the forFile variant, and
- * releases it. Fail-soft: any error (unreadable file, sidecar down) returns
- * `undefined` so cold replay/list never blocks on a system-prompt render.
- */
-export async function renderSystemPromptForFile(file: string): Promise<string | undefined> {
-  const sidecar = acquire();
-  try {
-    await sharedStart;
-    const data = await sidecar.call<{ systemPrompt?: string }>("session.systemPrompt.forFile", { file });
-    return data?.systemPrompt ?? undefined;
-  } catch (error) {
-    process.stderr.write(`omp sdk systemPrompt.forFile failed for ${file}: ${String(error)}\n`);
-    return undefined;
-  } finally {
-    release();
-  }
-}
-
 // ---------------------------------------------------------------------------
 
 /** One OMP skill's discovery metadata (name/description + body location). */

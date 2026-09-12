@@ -10,15 +10,14 @@
  * holds a persistent write fd, TUI included), so /proc fd scans are only an
  * auxiliary badge signal. The primary trigger is an incremental user-role
  * record whose text was never delivered by us (`knownUserTexts`) — i.e. a
- * foreign prompt — found while replaying file growth past a per-entry cursor.
+ * foreign prompt — found while replaying file growth past the shared cache entry's cursor.
  */
 import { statSync } from "node:fs";
 import { SessionPreparation, SessionSeq, type Session, type SessionEvent } from "@deepseek-ai/dsh-session";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
-import { readOmpTranscript, scanForeignWriters } from "./omp-store.js";
-import { replayOmpTranscript } from "./replay.js";
-import { renderSystemPromptForFile } from "./sdk-client.js";
+import { scanForeignWriters } from "./omp-store.js";
 import { getBridgeStore } from "./store/index.js";
+import { eventsForSessionFile, ingestSessionFileGrowth, sessionCacheEntryOf, touchSessionCacheEntry } from "./session-persistence-omp.js";
 import { FILE_FOLLOW_INTERVAL_MS, SHADOW_TTL_MS, TRANSITION_FOLLOW_INTERVAL_MS } from "./knobs.js";
 
 export type SupervisorRole = "cold" | "shadow" | "held" | "avoiding";
@@ -33,13 +32,6 @@ interface SessionsSlice {
 }
 
 type ReplayedEvent = SessionEvent & { surfaceOp?: "append"; sourceEventSeqs?: number[] };
-
-/** Content cursor: how far into the transcript this entry has ingested. */
-interface Cursor {
-  lastSeq: number;
-  size: number;
-  mtimeMs: number;
-}
 
 interface ShadowProjection {
   session: Session;
@@ -58,17 +50,18 @@ function userText(message: unknown): string | undefined {
 interface Entry {
   role: SupervisorRole;
   file: string;
-  title?: string;
-  createdAt?: number;
   foreignPid?: number;
   shadow?: ShadowProjection;
-  cursor?: Cursor;
   /** True once external writes were noted in this episode (reset on hold). */
   externalNoted: boolean;
   /** Avoidance hit while no shadow projection existed (create-held); note on materialize. */
   pendingNote: boolean;
   /** Guards the async shadow materialize against concurrent re-entry (same-id double enter). */
   materializing: boolean;
+  /** Guards the async follow ingest against concurrent re-entry (double delta append). */
+  ingesting: boolean;
+  /** In-flight fresh-hold baseline fill (awaited by the first ingest). */
+  pendingBaseline?: Promise<void>;
   lastViewedAt: number;
   lastFollowAt: number;
   knownUserTexts: Set<string>;
@@ -97,10 +90,20 @@ export class Supervisor {
   noteView(id: string): void {
     const entry = this.#entry(id);
     entry.lastViewedAt = Date.now();
+    touchSessionCacheEntry(entry.file); // LRU: mark the shared cache entry viewed too
     if (entry.role === "cold" && !entry.materializing && this.sessions !== undefined) {
       entry.materializing = true;
       void this.#materialize(id, entry);
     }
+  }
+
+  /** Whether this transcript file's session is actively followed (shadow or held). */
+  isFollowed(file: string): boolean {
+    if (file === "") return false;
+    for (const entry of this.entries.values()) {
+      if (entry.file === file && (entry.role === "shadow" || entry.role === "held")) return true;
+    }
+    return false;
   }
   /** Sync entries against the store; drop gone files; refresh role-agnostic state. */
   reconcile(): void {
@@ -112,11 +115,9 @@ export class Supervisor {
       seen.add(id);
       const entry = this.entries.get(id);
       if (entry === undefined) {
-        this.entries.set(id, { role: "cold", file: row.session_file, title: row.title ?? undefined, createdAt: row.created_at, lastViewedAt: 0, lastFollowAt: 0, externalNoted: false, pendingNote: false, materializing: false, knownUserTexts: new Set() });
+        this.entries.set(id, { role: "cold", file: row.session_file, lastViewedAt: 0, lastFollowAt: 0, externalNoted: false, pendingNote: false, materializing: false, ingesting: false, knownUserTexts: new Set() });
       } else {
         entry.file = row.session_file;
-        entry.title = row.title ?? undefined;
-        entry.createdAt = row.created_at;
       }
     }
     for (const [id, entry] of this.entries) {
@@ -152,13 +153,12 @@ export class Supervisor {
     entry.file = file;
     entry.foreignPid = undefined;
     entry.externalNoted = false;
-    if (entry.cursor === undefined && file !== "") {
-      // Fresh hold without a shadow: baseline at the file's current end so
-      // only records written AFTER this point are judged (no history false
-      // positives — historical user texts are not in knownUserTexts).
-      const { messages, modelChanges } = readOmpTranscript(file);
-      const events = replayOmpTranscript(messages, entry.title, entry.createdAt, modelChanges);
-      entry.cursor = { lastSeq: events.length, size: statSize(file), mtimeMs: statMtime(file) };
+    if (file !== "" && sessionCacheEntryOf(file) === undefined) {
+      // Fresh hold without a prior fill: baseline the shared cache entry at
+      // the file's current end so only records written AFTER this point are
+      // judged (no history false positives — historical user texts are not in
+      // knownUserTexts). Fire-and-forget; the fill is single-flight.
+      entry.pendingBaseline = this.#baselineFile(id, file).catch(() => {});
     }
   }
 
@@ -170,13 +170,9 @@ export class Supervisor {
     entry.knownUserTexts.clear();
     entry.foreignPid = undefined;
     entry.externalNoted = false;
-    // Re-baseline the cursor at the file's end: our own child's writes must
-    // not read back as foreign on the next watch pass.
-    if (entry.cursor !== undefined && entry.file !== "") {
-      const { messages, modelChanges } = readOmpTranscript(entry.file);
-      const events = replayOmpTranscript(messages, entry.title, entry.createdAt, modelChanges);
-      entry.cursor = { lastSeq: events.length, size: statSize(entry.file), mtimeMs: statMtime(entry.file) };
-    }
+    // Teardown is detach-only: the shared cache entry is NOT re-read here. A
+    // shadow demotion refills via #materialize (advancing the cursor past our
+    // child's writes); a cold demotion never re-ingests.
     if (entry.role === "shadow" && this.sessions !== undefined && entry.shadow === undefined) {
       void this.#materialize(id, entry);
     }
@@ -194,11 +190,17 @@ export class Supervisor {
   }
 
   /** One synchronous follow pass (test/diagnostic entry; same gating as a tick). */
-  poll(): void {
+  /** One follow pass (test/diagnostic entry; same gating as a tick). */
+  async poll(): Promise<void> {
     if (this.sessions === undefined) return;
     const foreign = scanForeignWriters();
     const now = Date.now();
-    for (const [id, entry] of this.entries) this.#followEntry(id, entry, foreign, now);
+    const work: Promise<void>[] = [];
+    for (const [id, entry] of this.entries) {
+      const pending = this.#followEntry(id, entry, foreign, now);
+      if (pending !== undefined) work.push(pending);
+    }
+    await Promise.all(work);
   }
 
   /** The follow loop: one tick, one /proc pass, per-entry cadence gating. */
@@ -207,7 +209,7 @@ export class Supervisor {
       if (this.disposed || this.sessions === undefined) return;
       const foreign = scanForeignWriters();
       const now = Date.now();
-      for (const [id, entry] of this.entries) this.#followEntry(id, entry, foreign, now);
+      for (const [id, entry] of this.entries) void this.#followEntry(id, entry, foreign, now);
     };
     tick();
     const timer = setInterval(tick, 1_000);
@@ -220,13 +222,13 @@ export class Supervisor {
   #entry(id: string): Entry {
     let entry = this.entries.get(id);
     if (entry === undefined) {
-      entry = { role: "cold", file: "", lastViewedAt: 0, lastFollowAt: 0, externalNoted: false, pendingNote: false, materializing: false, knownUserTexts: new Set() };
+      entry = { role: "cold", file: "", lastViewedAt: 0, lastFollowAt: 0, externalNoted: false, pendingNote: false, materializing: false, ingesting: false, knownUserTexts: new Set() };
       this.entries.set(id, entry);
     }
     return entry;
   }
 
-  #followEntry(id: string, entry: Entry, foreign: Map<string, number>, now: number): void {
+  #followEntry(id: string, entry: Entry, foreign: Map<string, number>, now: number): Promise<void> | undefined {
     const cadence = entry.role === "shadow" || entry.role === "held"
       ? FILE_FOLLOW_INTERVAL_MS
       : entry.role === "avoiding"
@@ -240,79 +242,74 @@ export class Supervisor {
         const shadow = entry.shadow;
         // Auxiliary fd badge (usually absent on omp 18 — content is the signal).
         entry.foreignPid = foreign.get(entry.file);
-        if (shadow !== undefined) this.#ingest(id, entry, shadow.session);
+        const pending = shadow !== undefined ? this.#ingest(id, entry, shadow.session) : undefined;
         if (SHADOW_TTL_MS !== 0 && now - entry.lastViewedAt > SHADOW_TTL_MS && shadow !== undefined) {
           shadow.detach();
           entry.shadow = undefined;
           entry.role = "cold";
         }
-        break;
+        return pending;
       }
       case "held": {
         // Content watch while we own the RPC child: a user record we never
         // delivered appearing in the file is a foreign writer (TUI) — avoid.
-        this.#ingest(id, entry);
-        break;
+        return this.#ingest(id, entry);
       }
       case "avoiding":
       case "cold":
-        break;
+        return undefined;
     }
   }
 
   /**
-   * Ingest transcript growth past the entry's cursor in one replay. When
-   * `appendTo` is given (shadow), incremental events are appended to the live
-   * projection; otherwise (held) only foreign-user detection runs. Fires the
-   * external-writer note / avoidance when an incremental user record's text
-   * was never delivered by us.
+   * Ingest transcript growth past the shared cache entry's cursor. The lenient
+   * delta is scanned for foreign user records REGARDLESS of the entry validation
+   * outcome; when `appendTo` is given (shadow), the VALIDATED delta is appended
+   * to the live projection. Fires the external-writer note / avoidance when an
+   * incremental user record's text was never delivered by us.
    */
-  #ingest(id: string, entry: Entry, appendTo?: Session): void {
-    const cursor = entry.cursor;
-    if (cursor === undefined || entry.file === "") return;
-    let size: number;
-    let mtimeMs: number;
+  async #ingest(id: string, entry: Entry, appendTo?: Session): Promise<void> {
+    if (entry.file === "" || entry.ingesting) return;
+    entry.ingesting = true;
     try {
-      const stat = statSync(entry.file);
-      size = stat.size;
-      mtimeMs = stat.mtimeMs;
-    } catch {
-      return;
-    }
-    if (size === cursor.size && mtimeMs === cursor.mtimeMs) return;
-    const { messages, modelChanges } = readOmpTranscript(entry.file);
-    const events = replayOmpTranscript(messages, entry.title, entry.createdAt, modelChanges) as ReplayedEvent[];
-    if (events.length <= cursor.lastSeq) {
-      // Growth-free rewrite (title-slot in-place update): re-baseline stat only.
-      cursor.size = size;
-      cursor.mtimeMs = mtimeMs;
-      return;
-    }
-    let foreignText = "";
-    for (const event of events) {
-      if (event.seq < cursor.lastSeq) continue;
-      if (appendTo !== undefined) {
-        if (event.surfaceOp === "append") {
-          // Only cite source seqs when the replay actually provides them: an
-          // empty array trips dsh-session's assertProvenance on every
-          // non-assistant/message append (user/message, tool/result) — the
-          // live bridge omits the key entirely, so mirror that.
-          appendTo.append(event.type, event.data, event.sourceEventSeqs === undefined
-            ? { surfaceOp: "append" }
-            : { surfaceOp: "append", sourceEventSeqs: event.sourceEventSeqs.map((seq) => SessionSeq(seq)) });
-        } else {
-          appendTo.append(event.type, event.data);
+      if (entry.pendingBaseline !== undefined) {
+        await entry.pendingBaseline;
+        entry.pendingBaseline = undefined;
+      }
+      const { foreign, shadow } = await ingestSessionFileGrowth(entry.file, id, this.fillLogger);
+      // Foreign detection runs on the lenient delta (always, even on validation failure).
+      let foreignText = "";
+      for (const event of foreign) {
+        if (foreignText === "" && event.type === "user/message") {
+          const text = userText(event.data);
+          if (text !== undefined && text !== "" && !entry.knownUserTexts.has(text)) foreignText = text;
         }
       }
-      if (foreignText === "" && event.type === "user/message") {
-        const text = userText(event.data);
-        if (text !== undefined && text !== "" && !entry.knownUserTexts.has(text)) foreignText = text;
+      // Shadow append runs on the validated delta (empty on validation failure → no invalid appends).
+      if (appendTo !== undefined) {
+        for (const event of shadow as ReplayedEvent[]) {
+          if (event.surfaceOp === "append") {
+            // Only cite source seqs when the replay actually provides them: an
+            // empty array trips dsh-session's assertProvenance on every
+            // non-assistant/message append (user/message, tool/result) — the
+            // live bridge omits the key entirely, so mirror that.
+            appendTo.append(event.type, event.data, event.sourceEventSeqs === undefined
+              ? { surfaceOp: "append" }
+              : { surfaceOp: "append", sourceEventSeqs: event.sourceEventSeqs.map((seq) => SessionSeq(seq)) });
+          } else {
+            appendTo.append(event.type, event.data);
+          }
+        }
       }
+      if (foreignText !== "") this.#onForeignUser(id, entry, foreignText);
+    } catch {
+      // A transient read/stat/replay failure must never wedge a follow tick.
+      // Clear a rejected baseline too: stored un-caught it would re-reject on
+      // every later #ingest await, wedging the hold.
+      entry.pendingBaseline = undefined;
+    } finally {
+      entry.ingesting = false;
     }
-    cursor.lastSeq = events.length;
-    cursor.size = size;
-    cursor.mtimeMs = mtimeMs;
-    if (foreignText !== "") this.#onForeignUser(id, entry, foreignText);
   }
 
   /** An incremental user record we never delivered: note it, or avoid. */
@@ -351,12 +348,8 @@ export class Supervisor {
       return;
     }
     const row = getBridgeStore()?.byFile(entry.file);
-    const { messages, modelChanges } = readOmpTranscript(entry.file);
-    // Cold scan: best-effort system prompt render (fail-soft, ~2s on a cold
-    // session). A failure leaves it undefined and the shadow still materializes.
-    const systemPrompt = await renderSystemPromptForFile(entry.file);
-    const seed = replayOmpTranscript(messages, entry.title ?? row?.title ?? undefined, entry.createdAt ?? row?.created_at, modelChanges, systemPrompt);
     try {
+      const seed = await eventsForSessionFile(entry.file, id, this.fillLogger);
       const preparation = await SessionPreparation.create(
         this.sessions.prepare(id, {
           seed,
@@ -367,7 +360,6 @@ export class Supervisor {
       this.sessions.announce(preparation.session);
       preparation[Symbol.dispose]();
       entry.shadow = { session: preparation.session, detach };
-      entry.cursor = { lastSeq: seed.length, size: statSize(entry.file), mtimeMs: statMtime(entry.file) };
       entry.role = "shadow";
       entry.externalNoted = false;
       if (entry.pendingNote) {
@@ -379,6 +371,16 @@ export class Supervisor {
     } finally {
       entry.materializing = false;
     }
+  }
+
+  /** The persistence fill's logger shape (fail-soft `warn`), backed by our log. */
+  private get fillLogger(): { warn: (message: string) => void } {
+    return { warn: (message) => this.log(message) };
+  }
+
+  /** Fill the shared cache entry to baseline its cursor (fresh hold). */
+  async #baselineFile(id: string, file: string): Promise<void> {
+    await eventsForSessionFile(file, id, this.fillLogger);
   }
 
   #appendForeignNote(session: Session): void {

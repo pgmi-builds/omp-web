@@ -97,10 +97,11 @@ async function createSession(params: any): Promise<string> {
   if (params?.appendSystemPrompt !== undefined) opts.appendSystemPrompt = params.appendSystemPrompt;
   // approval parity with `omp --approval-mode`: yolo = fully auto-approved.
   if (params?.approvalMode === "yolo") opts.autoApprove = true;
-  if (params?.resumeFile) opts.sessionManager = SessionManager.open(params.resumeFile);
-  else if (params?.persistence === "file") opts.sessionManager = SessionManager.create(params.cwd ?? process.cwd());
-  else opts.sessionManager = SessionManager.inMemory();
-  // Unique registry identity per session (see nextAgentId).
+  // omp SDK >= 18.1 made the SessionManager constructors async (they return
+  // promises); await keeps compatibility with the older sync surface too.
+  if (params?.resumeFile) opts.sessionManager = await SessionManager.open(params.resumeFile);
+  else if (params?.persistence === "file") opts.sessionManager = await SessionManager.create(params.cwd ?? process.cwd());
+  else opts.sessionManager = await SessionManager.inMemory();
   opts.agentId = nextAgentId();
 
   const { session } = await createAgentSession(opts as any);

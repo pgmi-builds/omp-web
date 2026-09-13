@@ -7,7 +7,7 @@
 ## 〇、这个仓库是什么
 
 - Repo: `~/workspaces/dsh-omp`，remote `git@github.com:pgmi-builds/omp-web.git`（2026-09-02 由 `omp-webui` 改名，旧 URL 自动重定向），branch `master`。
-- 唯一在产包: `apps/omp-web` = **`@pgmi-builds/omp-web`**（v0.2.0 起，品牌统一为 **omp-web**——与 profile 名、systemd unit、DSH_HOME、域名一致，正如 dsh 的 `web`）。与 better-dsh 同一插件模型的 cordis/dsh 插件：在 `ctx.agents` 注册 AgentFactory，spawn `omp --mode rpc`（原生 OMP，`~/.local/bin/omp` Bun ELF，当前 18.0.11），把 OMP 的 RPC 面（prompt/follow_up/steer/abort/get_state/get_messages/set_model + resume）桥进 dsh Agent/Session 契约；OMP-backed LlmAdapter 按 OMP `config.yml` 的 `modelRoles` 提供模型选择。
+- 唯一在产包: `apps/omp-web` = **`@pgmi-builds/omp-web`**（v0.2.0 起，品牌统一为 **omp-web**——与 profile 名、systemd unit、DSH_HOME、域名一致，正如 dsh 的 `web`）。与 better-dsh 同一插件模型的 cordis/dsh 插件：在 `ctx.agents` 注册 AgentFactory，spawn `omp --mode rpc`（原生 OMP，`~/.local/bin/omp` Bun ELF，当前 **18.1.16**；SDK `@oh-my-pi/pi-coding-agent` 18.1.14——18.1 起 `SessionManager.open/create/inMemory` 返回 promise，sidecar 已 await 兼容），把 OMP 的 RPC 面（prompt/follow_up/steer/abort/get_state/get_messages/set_model + resume）桥进 dsh Agent/Session 契约；OMP-backed LlmAdapter 按 OMP `config.yml` 的 `modelRoles` 提供模型选择。
 - 插件形态: `dsh.bundle.patch` = 包内 `cordis.patch.yml`（随 npm tarball 分发）——mount `omp-provider`、禁用被 OMP 取代的原生组件（agent-loop、原生 llm routes）。profile 侧零文件改动，`dsh plugin add` 一条命令即装即挂。
 - 依赖声明与 better-dsh 同构：8 个 `@deepseek-ai/*` harness 依赖全部是 **optional peerDependencies**，运行期由 host 提供；类型检查走仓内 vendored `types/@deepseek-ai/*`（tsconfig `paths` 指过去，portable，无需 dsh checkout）。构建 = 纯 `tsc -p tsconfig.json`（src → dist），无 tsdown、无 client 半边。包内 `.npmrc` 设 `auto-install-peers=false`（嵌套 peer 副本会破坏 harness 的 `scopeOf` 身份）。
 - src 速览: `index.ts`（provider Service/AgentFactory）、`rpc.ts`（OmpRpcClient）、`agent.ts`/`adapter.ts`/`replay.ts`/`session-persistence-omp.ts`/`supervisor.ts`/`models.ts`/`knobs.ts`/`pairing.ts`/`permission.ts`、`store/`（SQLite bridge store）。
@@ -24,7 +24,7 @@
    └─ symlink → /home/u1/.local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js
 ```
 
-- 全局 `@deepseek-ai/dsh` = npm **0.1.3-alpha.2**（2026-09-08 dashr 对齐轮升级；vendored node_modules），与 `~/.dsh` 的 Dash Agent prod、omp-web 3081 共用同一份。**omp-web 0.2.0 与该宿主的 persistence seam 不兼容（v2 handle-based seam）——升级包 0.3.0 见 openspec change 2026-09-08。**
+- 全局 `@deepseek-ai/dsh` = npm **0.1.5-rc.2**（2026-09-10/11 dashr rc.2 对齐轮升级；vendored node_modules），与 `~/.dsh` 的 Dash Agent prod(3080)、omp-web 3081 共用同一份——**全局宿主 = 上游 checkout pin = dsh-v0.1.5-rc.2，三层对齐**（2026-09-12 核实）。omp-web prod = **0.2.2-a**（2026-09-12 发布）；npm 字母预发布线最新 = **0.2.2-b**（2026-09-14 发布，sidecar theme 修复），prod 待装。早期记录的 0.1.3-alpha.2 / omp-web 0.2.x 时代条目已过时，仅存于带日期的历史快照。
 - systemd **user** unit `~/.config/systemd/user/omp-web.service`（前身 `omp-plus.service` 已退役）：
   - `ExecStart=/opt/node-v22.23.2/bin/node /home/u1/.local/bin/dsh --profile omp-web --no-open --trusted-host omp.pc.randomhash.app`
   - `WorkingDirectory=DSH_HOME=/home/u1/.omp/omp-web`，`OMP_HOME=/home/u1/.omp`
@@ -32,7 +32,7 @@
 
 ### Profile（`~/.omp/omp-web/profiles/omp-web`）
 
-- `package.json`: deps `@pgmi-builds/omp-web 0.2.0`（精确锁）+ `dsh-better-sidebar 0.18.0-alpha.0`；`dsh.profile.bundles` = `["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@pgmi-builds/omp-web", "dsh-better-sidebar"]`。
+- `package.json`: deps `@pgmi-builds/omp-web 0.2.2-a`（精确锁，2026-09-12 起；dsh-better-sidebar 已于 0.2.1 清理轮移除）；`dsh.profile.bundles` = `[@deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, @pgmi-builds/omp-web]`。
 - profile 自带 `pnpm-workspace.yaml`: `nodeLinker: hoisted`、`autoInstallPeers: false`（永不在 profile 树里嵌 `@deepseek-ai` 副本）、`minimumReleaseAgeExclude`（pnpm 11.7 供应链年龄门——新发布的包需进 exclude 才可装，`pnpm add` 会自动追加）。**勿信 `@latest`**：刚发布版本会被年龄门静默挡回旧豁免版并覆盖部署位（dashr 实证 0.2.1-d←0.2.1-a），升级一律精确版本 add。
 - **registry distribution（v0.1.2 起）**：pnpm-lock 以 npm registry integrity 锁定。部署/升级流：bump 版本 → `npm publish`（在 `apps/omp-web`，见下）→ profile 目录 `pnpm add @pgmi-builds/omp-web@<ver>` → 重启 unit。
 - **生产部署原则（2026-09-02 裁决，与 dashr 同款）：user, just another user**——prod 只从 registry 精确版本安装，不做源码级/手工同步侵入；`file:` 依赖与手工同步仅限未发布的本地迭代，且只落 §二 test profile。dev/test 与 prod 两条线据此分离。
@@ -51,15 +51,15 @@
 ### Caddy
 
 - live `/etc/caddy/Caddyfile`: `omp.pc.randomhash.app` → `127.0.0.1:3081`，dsh fence（`header_up Host` 重写 + 剥 `Origin`），无 gate（用户已批准）。**未经明确批准勿改**。
-- repo 的 `Caddyfile.opengate` 是独立的 dev/test 用文件（untracked），与 live 无关。
+- （历史）repo 根曾有独立 dev/test 用的 `Caddyfile.opengate`（untracked，与 live 无关）；2026-09-14 经用户指示删除，live Caddyfile 未动。
 
 ---
 
 ## 二、Dev/Test：4999 手动实例（upstream 源码 checkout，按需拉起）
 
-- harness 源码: `./upstream/dsh`，checkout @ tag **dsh-v0.1.3-alpha.2**（2026-09-08 对齐轮切至；自带 git repo，此处 gitignored），run 入口 `npm run dsh` = `node --import tsx/esm apps/cli/src/bin.ts`。**注意：`npm run dsh` 前必须 `pnpm run build`**（source-run 也要 `lib/` 产物，否则 MissingClientBundleError）。
+- harness 源码: `./upstream/dsh`，checkout @ tag **dsh-v0.1.5-rc.2**（2026-09-10/11 对齐轮切至；自带 git repo，此处 gitignored；= 全局宿主版本，三层对齐），run 入口 `npm run dsh` = `node --import tsx/esm apps/cli/src/bin.ts`。**注意：`npm run dsh` 前必须 `pnpm run build`**（source-run 也要 `lib/` 产物，否则 MissingClientBundleError）。
 - 本地 patch 三件套（checkout 工作树内，随 tag 重放）：① `pnpm-workspace.yaml` 加 `storeDir: .scratch 可写路径` + `verifyDepsBeforeRun: false`（pnpm 11 不读 .npmrc，用户级只读 store EROFS）；② 根 package.json devDeps 加 `"unrun": "^0.3.1"`（tsdown 0.22 config loader 需要，upstream 未声明）；③ `packages/client/tsdown.client.ts` 的 `REPOSITORY_ROOT` 用 `resolveRepositoryRoot()`（pnpm-workspace.yaml 锚定 + cwd 回退——unrun 把 config 编译进 `node_modules/.unrun/` 后 `import.meta.url` 失锚）。三条与 dashr 轮记录互证。
-- 测试约定（沿用 2026-09-01 契约）: profile `omp-web-test` 于 `$DSH_HOME/profiles/omp-web-test`（与 prod 共 DSH_HOME、分 profile；**2026-09-08 已建**：bundles = dsh-base/dsh-web-app/omp-web，dep 用 `link:` 指向本仓 `apps/omp-web`，patch 层 `webserver.port=4999`），OMP 侧仍指共享 `~/.omp`。插件本体先 tsc 构建。runtime 拉起在端口 **4999**；**4999 与 dashr 的测试线共用**——拉起前 `ss -tlnp | grep 4999` 查占用（dashr 遗留 unit 名 `dsh-4999-test`），EADDRINUSE 启动竞态两轮实测均在。
+- 测试约定（沿用 2026-09-01 契约）: profile `omp-web-test` 于 `$DSH_HOME/profiles/omp-web-test`（与 prod 共 DSH_HOME、分 profile；**2026-09-08 已建**：bundles = dsh-base/dsh-web-app/omp-web，dep 用 `link:` 指向本仓 `apps/omp-web`），OMP 侧仍指共享 `~/.omp`。插件本体先 tsc 构建。runtime 端口：profile patch 层 `webserver.port = !!js ctx.webStartup.port ?? 4999`——**CLI `--port N` 获胜，裸启动回退 4999**（2026-09-12 实证：CLI `--port` 会被 patch 字面量盖掉，`--patch` 不是本 host 的 CLI flag）。默认 4999 与 dashr 测试线共用，另实测 4998 也常被占——拉起前 `ss -tlnp | grep 499x` 查占用，备选 4997/4996。EADDRINUSE 启动竞态多轮实测均在。
 - 测完: **把 4999 runtime 关停**（`systemctl --user stop omp-web-4999-test`，勿 kill）；Caddy 不动。（2026-09-08 状态：对齐轮冒烟全绿后 instance 留给用户手动验收中，token 每次重启轮换，从 journal 取。）
 - 免 harness 的单元回路: `cd apps/omp-web && npm run build && node --test test/*.test.mjs`（node:test 套件 import `../dist`；注意本机 Node 22.22.1 下 `node --test test/` 会被当作模块路径，必须用 glob）。vendored types 使 tsc 无需 dsh checkout。
 
@@ -84,6 +84,8 @@ npm publish --access public --cache ~/workspaces/dsh-omp/.scratch/npm-cache
 ---
 
 ## 三、Repo 状态与风险
+**2026-09-14 快照（sidecar theme 修复轮）**：sidecar 启动时初始化 SDK theme 实例（headless 下 `theme.status` 未初始化会让 lsp 工具的 formatter 崩、设备不可用），并补回被误删的 `../dist/protocol.js` import（缺它 sidecar 启动即 `ReferenceError: PROTOCOL_VERSION is not defined`、退出 1）。仓库根新增 `lsp.json`（**gitignored**）——OMP 的 lsp 服务器注册表按 cwd 的 rootMarkers 过滤（一层 readdir、**不向上找**），本仓 marker 全在 `apps/omp-web/`，故根 cwd 零服务器；改配置后必须用 lsp 工具 `action=reload` 或重启 sidecar（进程内 per-cwd `configCache`）。`Caddyfile.opengate` 已删（与 live Caddy 无引用关系）。发布 **0.2.2-b**，prod 待装。
+
 
 **2026-09-08 快照（upstream 0.1.3-alpha.2 对齐轮）**：checkout @ dsh-v0.1.3-alpha.2（三 patch，见 §二）构建全绿；omp-web 迁移到 v2 seam（persistence handle 面、session v2 流式/词表、header 身份一致性），tsc 0 错 + 单测 30/30 + 4999 全链路冒烟通过——实测报告 `docs/upstream-dsh-0.1.3-alpha.2-local-test-report.md`，openspec change `openspec/changes/2026-09-08-upstream-0-1-3-alpha-2-alignment/`。**prod 3081 = 旧 omp-web 0.2.0 跑在已升级宿主上（seam 违约态），发布 0.3.0 + 重启 3081 是下一步（T5/T6）**；peer 精确 pin 待裁决（T4）。新增未入库：`docs/upstream-dsh-0.1.3-alpha.2-report.md`（调研）+ `-local-test-report.md`（本轮实测）、openspec change 目录。
 
@@ -92,7 +94,7 @@ npm publish --access public --cache ~/workspaces/dsh-omp/.scratch/npm-cache
 - **v0.2.0 rebrand 已全链路落地（2026-09-02）**: `omp-webui` → `omp-web` 统一品牌——GitHub repo 改名（旧 URL 重定向）、npm `@pgmi-builds/omp-web@0.2.0` 发布、prod profile 切换（lock integrity = 发布 tarball shasum）、`omp-web.service` 重启验证（active、3081 应答、bridge-store 正常打开）。v0.1.2 时代的未提交漂移（`RemoteError` preset fix）已随本次提交收敛入库。
 - 旧的 `@pgmi-builds/omp-webui` npm 包保留在 registry（最后 0.1.2），不 unpublish、不再维护；无外部用户依赖（用户确认）。
 - `master` 与 origin 同步；发布走 git tag（`v0.0.2`…`v0.2.0`）。
-- Untracked/遗留: `Caddyfile.opengate`、`.dsh_better_edit/`（编辑工具产物，.gitignore 候选）；`docs/upstream-dsh-0.1.2-alpha.5-report.md`、`docs/upstream-dsh-community-survey.md`（2026-09-02/03 上游调研产物——alpha.3→alpha.5 改进报告 + 社区生态调研，核心结论：市场 1000 条目中零 OMP 桥接、omp-web 独一份；harness 升级决策的前置材料，未入库）；`~/.config/systemd/user/dsh-omp.service.d` 孤儿 drop-in（unit 已不存在，无害，可清理）；`omp-web-test` profile 已从盘上移除（按需重建）；profile `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 里残留一条 `@pgmi-builds/omp-webui@0.1.2`（无害）。
+- Untracked/遗留: `.dsh_better_edit/`（编辑工具产物，.gitignore 候选）；`docs/upstream-dsh-0.1.2-alpha.5-report.md`、`docs/upstream-dsh-community-survey.md`（2026-09-02/03 上游调研产物——alpha.3→alpha.5 改进报告 + 社区生态调研，核心结论：市场 1000 条目中零 OMP 桥接、omp-web 独一份；harness 升级决策的前置材料，未入库）；`~/.config/systemd/user/dsh-omp.service.d` 孤儿 drop-in（unit 已不存在，无害，可清理）；`omp-web-test` profile 已从盘上移除（按需重建）；profile `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 里残留一条 `@pgmi-builds/omp-webui@0.1.2`（无害）。
 - 版本线: v0.0.3 删集中化 omp-sessions.json → v0.1.0 收敛为 `apps/` 布局 + session supervisor → v0.1.1 以 SQLite（bridge-store.sqlite）重新引入集中 index、废弃 mobile/in-dsh apps（→ `archived/`）→ v0.1.2 registry 分发 + model-selection bridge → **v0.2.0 rebrand omp-web**。
 
 ---
@@ -107,3 +109,19 @@ npm publish --access public --cache ~/workspaces/dsh-omp/.scratch/npm-cache
 - **浏览器侧信任缺口（omp-web 待验证风险）**：原生 ui-settings 的 describe mirror 在非 loopback 页面 = memory = terminally unavailable（"settings are unavailable in this browser"，Settings/Models 页瘫；上游设计笔记定性为实现产物而非设计决策）。`omp.pc.randomhash.app` 页面权威非 loopback，而 omp-web **无 client 半**、无 ownsHost 补偿——dashr 的 B 机制 = host 半监听 `webserver/index-inject` push head 内联脚本设 `window.__DSH_TRANSPORT__={ownsHost:true}`（head 先于一切 bundle，无时序竞争；ownsHost 属 off-label，对齐轮盯其消费点）。域名上若需 Settings/Models 页需评估补 client 半；loopback 直连 127.0.0.1:3081 不受影响。
 - **上游对齐轮（harness 新 tag 时）**：S1 先查 patch 载体文件（`package.json`/`pnpm-workspace.yaml`）tag 间 diff + 插件引用的 `@deepseek-ai/*` 名在新 tag 包集合是否齐全；S2 备份 → stash → checkout → pop 重放本地 patch（本仓 = §二 三件套：storeDir/unrun/resolveRepositoryRoot）；S4 `set -o pipefail`、install/build 错误读全文勿只看尾部；S6/7 用 §二 systemd-run 配方拉 4999 + 冒烟；差异报告落 `docs/upstream-dsh-<version>-report.md`（调研）+ `-local-test-report.md`（实测）；发现 → openspec change，坑/约定回写本文件。
 - **session v2 速查（0.1.3-alpha.2 实测沉淀，2026-09-08）**：① persistence seam = handle-based 五方法 `create/open/flush/stat/list` + `SessionHandle`（read/write、`read(offset,length)`、append/flush/close、`SessionReadOnlyError`/`SessionHandleClosedError`），v1 的 `load/inspect/prepare/borrowSession/readRaw/locate` 全删；宿主里唯一 `create`/`open('write')` 生产者是 agent-loop——被 patch 禁用的插件（omp-web）写路径天然闲置，纯读方即可。② **header 身份三路折叠**：`assertSessionHeadersCompatible` 跨 live/listed/loaded 比对 id/createdAt/cwd/parentSession/isSeeded/delegationDepth——插件行数据与 prepare 时宿主盖的 header 必须逐字段相等（Date.now() 双写 = 毫秒差 = 一行毒行令整个 list SOURCE_CONFLICT）；行镜像 header 是唯一稳态，reconcile 扫描不得覆写桥接授权字段。③ 流式：`assistant/chunk` 词表已删，`assistant/message` 必带内嵌 `stream: AssistantStreamRecord[]`（v1 兼容 view：`sourceEventSeqs` 在 assistant/message 上为 never），live 走 `agent/assistant-stream` 帧（start/密集 chunk/end，revision 单调）由 session-controller 折叠重连基线。④ `SessionEventMap` 核心词表 = turn/step 括号 + user/message + assistant/message + assistant/attempt + tool/call + tool/result + request/header(必填 reason) + request/context + session/end-seed；`KNOWN_SESSION_EVENT_TYPES` 是**生成的静态 catalog**（无运行时注册机制，downstream 插件事件靠 `ignorable` 标记），omp-web 合成的 session/title、permission/*、agent-preset/selected 均在 catalog 内。⑤ seed 校验深度分层：`validateStoredEvents`（类型+envelope）放行 ≠ session seed 校验放行（assistant/message 缺 `stream` 即拒）——replay 产物要按 v2 data 完整形状造。⑥ `SessionHeader` v2 必填 `isSeeded`；`SessionSeq`/`SessionLogOffset` 是 brand，构造侧用 `SessionSeq(n)`/`SessionLogOffset(n)`；resumed 会话 seed 校验走 RestoredSessionOptions（全 header + inheritedEventCount + eventState）。⑦ wire：HTTP API = typert RPC `POST /api/<ns>/<method>`，envelope `{type:"client-request",rpcId,method:"<ns>/<method>",payload:{args:{request|_request}}}`（list 类用 `_request`，命令类用 `request`）；`session/page` 的 `throughSeq > cursor` 直接报错并回吐当前 cursor。
+
+---
+
+## 五、嵌套 AGENTS.md 约定
+
+- **本文件身份**：OMP Web（dsh-omp 仓库）的根 AGENTS.md（总纲，无更上层）。
+- **嵌套（Nesting）**：支持层层嵌套，但每一层并非都必须有——只在有实质内容的子目录放置；中间层级无 AGENTS.md 则跳过，沿用最近上层。
+- **作用范围（Scope）**：每个 AGENTS.md 只管辖其所在目录及所有子目录，不约束兄弟目录、不反向影响上层。
+- **优先级（Precedence）**：对某文件，生效规则 = 从根到该文件路径上所有 AGENTS.md 的叠加；冲突时离文件最近者胜出（nearest wins）；用户显式指令优先级高于一切 AGENTS.md。
+- **子目录模板**：子目录/孙目录若需自己的 AGENTS.md，复制下方模板、填入 `<相对路径>` 即可（"去根目录拿一个"；中间层级无 AGENTS.md 时上层直指根）：
+
+  ```markdown
+  # <相对路径> — AGENTS.md
+
+  本文件是 `<相对路径>` 子目录的 AGENTS.md。上层为 OMP Web（dsh-omp）根目录 `AGENTS.md`；其规则对本目录仍有效，冲突时以本文件为准。
+  ```

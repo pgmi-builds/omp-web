@@ -34,6 +34,9 @@ Thumbs.db
 .agents/
 .pi/
 .dsh-test/
+# LSP server registry for OMP's lsp tool (its rootMarkers filter is cwd-only;
+# the repo root has no package.json/tsconfig.json — those live in apps/omp-web/)
+lsp.json
 
 --- deprecated apps (kept on disk for reference, never tracked) ---
 archived/

@@ -12,8 +12,29 @@
  * (newSession / switchSession / fork) mint a NEW OMP session id while the
  * bridge-side handle must stay stable for the lifetime of the client.
  */
-import { createAgentSession, SessionManager, discoverAuthStorage, ModelRegistry, Settings, loadSessionMessagesReadOnly, parseSessionEntries, discoverSkills, discoverSlashCommands, AgentRegistry } from "@oh-my-pi/pi-coding-agent";
+import { createAgentSession, SessionManager, discoverAuthStorage, ModelRegistry, Settings, loadSessionMessagesReadOnly, parseSessionEntries, discoverSkills, discoverSlashCommands, AgentRegistry, getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent";
 import { PROTOCOL_VERSION, type EventFrame, type RequestFrame, type ResponseFrame } from "../dist/protocol.js";
+// The SDK's lsp tool formats results through the module-level `theme`
+// instance, which only TUI mode initializes. In this headless sidecar any
+// `theme.status` access crashes ("undefined is not an object") — the lsp
+// device was unusable in the bridge line. Initialize the configured theme
+// (config.yml `theme.dark`) at startup; fall back to a minimal identity stub
+// so startup can never fail over cosmetics.
+try {
+  // The lsp formatter only touches `theme.status` icons, so the identity stub
+  // is the guaranteed floor; the configured theme (config.yml theme.dark,
+  // "titanium" in this deployment) is preferred when loadable.
+  const stub = {
+    status: { success: "✓", warning: "⚠", error: "✗" },
+    fg: (_role: unknown, text?: string) => (typeof text === "string" ? text : ""),
+  } as unknown as Parameters<typeof setThemeInstance>[0];
+  setThemeInstance((await getThemeByName("titanium")) ?? stub);
+  console.error("[sidecar] theme initialized");
+}
+catch (error) {
+  console.error(`[sidecar] theme init failed (lsp device may crash): ${error}`);
+  if (error instanceof Error) console.error(error.stack?.split("\n").slice(0, 8).join("\n") ?? "(no stack)");
+}
 
 // ---------- outbound ----------
 

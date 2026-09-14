@@ -24,7 +24,7 @@
    └─ symlink → /home/u1/.local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js
 ```
 
-- 全局 `@deepseek-ai/dsh` = npm **0.1.5-rc.2**（2026-09-10/11 dashr rc.2 对齐轮升级；vendored node_modules），与 `~/.dsh` 的 Dash Agent prod(3080)、omp-web 3081 共用同一份——**全局宿主 = 上游 checkout pin = dsh-v0.1.5-rc.2，三层对齐**（2026-09-12 核实）。omp-web prod = **0.2.2-a**（2026-09-12 发布）；npm 字母预发布线最新 = **0.2.2-b**（2026-09-14 发布，sidecar theme 修复），prod 待装。早期记录的 0.1.3-alpha.2 / omp-web 0.2.x 时代条目已过时，仅存于带日期的历史快照。
+- 全局 `@deepseek-ai/dsh` = npm **0.1.5-rc.2**（2026-09-10/11 dashr rc.2 对齐轮升级；vendored node_modules），与 `~/.dsh` 的 Dash Agent prod(3080)、omp-web 3081 共用同一份——**全局宿主 = 上游 checkout pin = dsh-v0.1.5-rc.2，三层对齐**（2026-09-12 核实）。omp-web prod = **0.2.2-b**（npm 字母预发布线，2026-09-14 发布并装机；前版 0.2.2-a = 2026-09-12）。早期记录的 0.1.3-alpha.2 / omp-web 0.2.x 时代条目已过时，仅存于带日期的历史快照。
 - systemd **user** unit `~/.config/systemd/user/omp-web.service`（前身 `omp-plus.service` 已退役）：
   - `ExecStart=/opt/node-v22.23.2/bin/node /home/u1/.local/bin/dsh --profile omp-web --no-open --trusted-host omp.pc.randomhash.app`
   - `WorkingDirectory=DSH_HOME=/home/u1/.omp/omp-web`，`OMP_HOME=/home/u1/.omp`
@@ -32,7 +32,7 @@
 
 ### Profile（`~/.omp/omp-web/profiles/omp-web`）
 
-- `package.json`: deps `@pgmi-builds/omp-web 0.2.2-a`（精确锁，2026-09-12 起；dsh-better-sidebar 已于 0.2.1 清理轮移除）；`dsh.profile.bundles` = `[@deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, @pgmi-builds/omp-web]`。
+- `package.json`: deps `@pgmi-builds/omp-web 0.2.2-b`（精确锁，2026-09-14 起；dsh-better-sidebar 已于 0.2.1 清理轮移除）；`dsh.profile.bundles` = `[@deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, @pgmi-builds/omp-web]`。
 - profile 自带 `pnpm-workspace.yaml`: `nodeLinker: hoisted`、`autoInstallPeers: false`（永不在 profile 树里嵌 `@deepseek-ai` 副本）、`minimumReleaseAgeExclude`（pnpm 11.7 供应链年龄门——新发布的包需进 exclude 才可装，`pnpm add` 会自动追加）。**勿信 `@latest`**：刚发布版本会被年龄门静默挡回旧豁免版并覆盖部署位（dashr 实证 0.2.1-d←0.2.1-a），升级一律精确版本 add。
 - **registry distribution（v0.1.2 起）**：pnpm-lock 以 npm registry integrity 锁定。部署/升级流：bump 版本 → `npm publish`（在 `apps/omp-web`，见下）→ profile 目录 `pnpm add @pgmi-builds/omp-web@<ver>` → 重启 unit。
 - **生产部署原则（2026-09-02 裁决，与 dashr 同款）：user, just another user**——prod 只从 registry 精确版本安装，不做源码级/手工同步侵入；`file:` 依赖与手工同步仅限未发布的本地迭代，且只落 §二 test profile。dev/test 与 prod 两条线据此分离。
@@ -84,7 +84,7 @@ npm publish --access public --cache ~/workspaces/dsh-omp/.scratch/npm-cache
 ---
 
 ## 三、Repo 状态与风险
-**2026-09-14 快照（sidecar theme 修复轮）**：sidecar 启动时初始化 SDK theme 实例（headless 下 `theme.status` 未初始化会让 lsp 工具的 formatter 崩、设备不可用），并补回被误删的 `../dist/protocol.js` import（缺它 sidecar 启动即 `ReferenceError: PROTOCOL_VERSION is not defined`、退出 1）。仓库根新增 `lsp.json`（**gitignored**）——OMP 的 lsp 服务器注册表按 cwd 的 rootMarkers 过滤（一层 readdir、**不向上找**），本仓 marker 全在 `apps/omp-web/`，故根 cwd 零服务器；改配置后必须用 lsp 工具 `action=reload` 或重启 sidecar（进程内 per-cwd `configCache`）。`Caddyfile.opengate` 已删（与 live Caddy 无引用关系）。发布 **0.2.2-b**，prod 待装。
+**2026-09-14 快照（sidecar theme 修复轮）**：sidecar 启动时初始化 SDK theme 实例（headless 下 `theme.status` 未初始化会让 lsp 工具的 formatter 崩、设备不可用），并补回被误删的 `../dist/protocol.js` import（缺它 sidecar 启动即 `ReferenceError: PROTOCOL_VERSION is not defined`、退出 1）。仓库根新增 `lsp.json`（**gitignored**）——OMP 的 lsp 服务器注册表按 cwd 的 rootMarkers 过滤（一层 readdir、**不向上找**），本仓 marker 全在 `apps/omp-web/`，故根 cwd 零服务器；改配置后必须用 lsp 工具 `action=reload` 或重启 sidecar（进程内 per-cwd `configCache`）。`Caddyfile.opengate` 已删（与 live Caddy 无引用关系）。已发布并装到 prod：**0.2.2-b**；4998 测试实例（socat LAN 门）测毕已停。
 
 
 **2026-09-08 快照（upstream 0.1.3-alpha.2 对齐轮）**：checkout @ dsh-v0.1.3-alpha.2（三 patch，见 §二）构建全绿；omp-web 迁移到 v2 seam（persistence handle 面、session v2 流式/词表、header 身份一致性），tsc 0 错 + 单测 30/30 + 4999 全链路冒烟通过——实测报告 `docs/upstream-dsh-0.1.3-alpha.2-local-test-report.md`，openspec change `openspec/changes/2026-09-08-upstream-0-1-3-alpha-2-alignment/`。**prod 3081 = 旧 omp-web 0.2.0 跑在已升级宿主上（seam 违约态），发布 0.3.0 + 重启 3081 是下一步（T5/T6）**；peer 精确 pin 待裁决（T4）。新增未入库：`docs/upstream-dsh-0.1.3-alpha.2-report.md`（调研）+ `-local-test-report.md`（本轮实测）、openspec change 目录。
